@@ -49,6 +49,56 @@ requires all three fields:
 | `name`     | Directory name of the subtree, created at `vendor/<name>`.        |
 | `rev`      | Revision to pull — a tag, branch, or commit-ish `git` understands. |
 
+## Replacing a dependency with a local checkout
+
+Analogous to go mod's `replace` directive, a dependency can be pointed at a
+local working copy while you develop against it. Create an optional
+`vendor/vendor_replace.json` mapping dependency names to directories:
+
+```json
+{
+  "libfoo": "../../checkouts/libfoo",
+  "libbar": "/home/you/src/libbar"
+}
+```
+
+Paths are resolved relative to `./vendor` (absolute paths are used as is), so
+`../../checkouts/libfoo` refers to a `checkouts/` directory next to your
+repository. On the next run, `vendor/libfoo` becomes a symlink to that
+directory:
+
+```sh
+./vendor.py            # apply replacements, then update the remaining subtrees
+./vendor.py --status   # show which dependencies are currently replaced
+./vendor.py --restore-replacements   # put the vendored checkouts back
+```
+
+Replaced dependencies are skipped during the subtree update, since pulling
+into a symlink would write straight into your local checkout.
+
+Removing an entry from `vendor_replace.json` (or deleting the file) restores
+the vendored checkout on the next run.
+
+### Staying invisible to git
+
+The replacement never shows up in `git status` and can never be committed by
+accident. Three things would otherwise give it away, so the script handles
+each of them:
+
+| Would show up as                  | Handled by                                     |
+| --------------------------------- | ---------------------------------------------- |
+| the subtree files deleted         | the `skip-worktree` index bit on those files    |
+| the symlink as an untracked file  | a managed section in `.git/info/exclude`        |
+| the checkout being gone           | parking it inside `.git/`, restored on undo     |
+
+Everything the feature needs to remember lives in `.git/vendor_replace/`
+(state file plus the parked checkouts), and `.git/info/exclude` is per-clone
+and never committed, so nothing of this leaks into the repository. Commits
+made while a replacement is active still carry the original vendored content,
+because the index is untouched. The `vendor_replace.json` file itself is
+excluded too, since it holds machine-local paths — if you would rather track
+it, `git add -f` it once and the exclude entry becomes a no-op.
+
 ## How it works
 
 For each entry in the manifest:
@@ -75,3 +125,9 @@ fetch step.
   tag or commit hash when you want reproducible updates.
 - The commit amend step opens your editor (`--edit`), giving you a chance to
   review or extend the generated message.
+- While a replacement is active, the vendored files carry the `skip-worktree`
+  bit, so git refuses to overwrite them on operations such as `git checkout`
+  of a branch that changes them. Run `./vendor.py --restore-replacements`
+  first if a git command complains about those paths.
+- `git clean -x` removes the ignored symlink. Re-running `./vendor.py`
+  recreates it, and `--restore-replacements` still finds the parked checkout.
