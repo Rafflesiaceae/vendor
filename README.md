@@ -23,6 +23,19 @@ Copy `vendor.py` into the root of your repository and run it from there:
 The script must be run from the repository root, since both the manifest path
 and the subtree prefixes are resolved relative to the current directory.
 
+## Updating the script version
+
+After changing `vendor.py`, refresh the version comment at the top of the
+file with:
+
+```sh
+./autoversion.py vendor.py
+```
+
+`autoversion.py` excludes the version comment from the XXH64 checksum. When
+the remaining content has changed, it increments the final version component
+and records the current date and checksum; otherwise it leaves the file alone.
+
 ## Configuration
 
 Create `vendor/vendor.json` containing a list of dependencies. Every entry
