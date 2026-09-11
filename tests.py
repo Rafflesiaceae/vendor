@@ -142,9 +142,29 @@ class VendorIntegrationTests(unittest.TestCase):
             json.dumps(manifest, indent=2) + "\n"
         )
 
-    def _run_vendor(self):
+    def _create_local_checkout(self, name, source_text):
+        """Create a local checkout whose content differs from every release."""
+        checkout = self.root / f"{name}-checkout"
+        checkout.mkdir()
+        shutil.copy2(self.sources[name] / f"{name}.h", checkout / f"{name}.h")
+        (checkout / f"{name}.c").write_text(source_text)
+        return checkout
+
+    def _write_replacement_config(self, replacements):
+        """Configure local checkouts with paths relative to vendor/."""
+        vendor_directory = self.consumer / "vendor"
+        config = {
+            name: os.path.relpath(checkout, vendor_directory)
+            for name, checkout in replacements.items()
+        }
+        (vendor_directory / "vendor_replace.json").write_text(
+            json.dumps(config, indent=2) + "\n"
+        )
+        return config
+
+    def _run_vendor(self, *arguments):
         """Invoke the copied script exactly as a consuming repository would."""
-        return run([sys.executable, "vendor.py"], self.consumer)
+        return run([sys.executable, "vendor.py", *arguments], self.consumer)
 
     def _assert_release(self, revision):
         """Check that both vendored source files match a tagged release."""
@@ -218,6 +238,139 @@ class VendorIntegrationTests(unittest.TestCase):
             self.consumer, "rev-list", "--first-parent", "--merges", "HEAD"
         ).splitlines()
         self.assertEqual(len(merge_commits), 6)
+        self.assertEqual(git(self.consumer, "status", "--porcelain"), "")
+
+    def test_replacement_is_invisible_and_idempotent(self):
+        """A replacement swaps in local code without dirtying the repository."""
+        self._run_vendor()
+        checkout = self._create_local_checkout(
+            "libanswer",
+            '#include "libanswer.h"\n\n'
+            "int answer(void)\n"
+            "{\n"
+            "    return 9001;\n"
+            "}\n",
+        )
+        config = self._write_replacement_config({"libanswer": checkout})
+        head_before_replacement = git(self.consumer, "rev-parse", "HEAD")
+
+        output = self._run_vendor()
+
+        vendored_checkout = self.consumer / "vendor" / "libanswer"
+        self.assertTrue(vendored_checkout.is_symlink())
+        self.assertEqual(vendored_checkout.resolve(), checkout.resolve())
+        self.assertIn("return 9001;", (vendored_checkout / "libanswer.c").read_text())
+        self.assertIn("Skipping 'libanswer'", output)
+        self.assertEqual(git(self.consumer, "status", "--porcelain"), "")
+        self.assertEqual(
+            git(
+                self.consumer,
+                "check-ignore",
+                "--no-index",
+                "vendor/vendor_replace.json",
+                "vendor/libanswer",
+            ).splitlines(),
+            ["vendor/vendor_replace.json", "vendor/libanswer"],
+        )
+
+        # The tracked checkout remains in the index while the local symlink is
+        # active, so commits cannot accidentally capture replacement content.
+        index_entry = git(
+            self.consumer,
+            "ls-files",
+            "-v",
+            "--",
+            "vendor/libanswer/libanswer.c",
+        )
+        self.assertTrue(index_entry.startswith("S "))
+        committed_source = git(
+            self.consumer, "show", "HEAD:vendor/libanswer/libanswer.c"
+        )
+        self.assertIn("return 41;", committed_source)
+
+        status = self._run_vendor("--status")
+        self.assertIn(f"libanswer -> {config['libanswer']}", status)
+        repeated_output = self._run_vendor()
+        self.assertIn("is already replaced", repeated_output)
+        self.assertEqual(
+            head_before_replacement, git(self.consumer, "rev-parse", "HEAD")
+        )
+        self.assertEqual(git(self.consumer, "status", "--porcelain"), "")
+
+    def test_removed_replacement_restores_and_catches_up(self):
+        """Removing a replacement restores its subtree and applies a new pin."""
+        self._run_vendor()
+        checkout = self._create_local_checkout(
+            "libanswer",
+            '#include "libanswer.h"\n\n'
+            "int answer(void)\n"
+            "{\n"
+            "    return 9001;\n"
+            "}\n",
+        )
+        self._write_replacement_config({"libanswer": checkout})
+        self._run_vendor()
+
+        # While libanswer is replaced it must be skipped, but unrelated
+        # dependencies should still follow the updated manifest.
+        self._write_manifest("v2.0.0")
+        commit_all(self.consumer, "Pin libraries to v2.0.0")
+        output = self._run_vendor()
+        self.assertIn("Skipping 'libanswer'", output)
+        self.assertIn(
+            'return "hello, world";',
+            (self.consumer / "vendor/libgreet/libgreet.c").read_text(),
+        )
+        self.assertIn("return 9001;", (checkout / "libanswer.c").read_text())
+
+        (self.consumer / "vendor/vendor_replace.json").unlink()
+        output = self._run_vendor()
+
+        restored_checkout = self.consumer / "vendor" / "libanswer"
+        self.assertIn("Restored 'vendor/libanswer'", output)
+        self.assertFalse(restored_checkout.is_symlink())
+        self._assert_release("v2.0.0")
+        index_entry = git(
+            self.consumer,
+            "ls-files",
+            "-v",
+            "--",
+            "vendor/libanswer/libanswer.c",
+        )
+        self.assertFalse(index_entry.startswith("S "))
+        self.assertEqual(
+            self._run_vendor("--status").strip(), "No active replacements."
+        )
+        self.assertEqual(git(self.consumer, "status", "--porcelain"), "")
+
+    def test_restore_replacements_command_restores_parked_checkout(self):
+        """The explicit restore command recovers a parked vendored subtree."""
+        self._run_vendor()
+        checkout = self._create_local_checkout(
+            "libanswer",
+            '#include "libanswer.h"\n\n'
+            "int answer(void)\n"
+            "{\n"
+            "    return 9001;\n"
+            "}\n",
+        )
+        self._write_replacement_config({"libanswer": checkout})
+        self._run_vendor()
+
+        # The command must restore immediately even while the replacement is
+        # still configured; a future normal run may choose to apply it again.
+        output = self._run_vendor("--restore-replacements")
+
+        self.assertIn("Restored 'vendor/libanswer'", output)
+        self.assertFalse((self.consumer / "vendor/libanswer").is_symlink())
+        self._assert_release("v1.0.0")
+        self.assertEqual(
+            self._run_vendor("--status").strip(), "No active replacements."
+        )
+
+        # Discard the local-only config after inspecting the restored state so
+        # the fixture finishes with the same clean worktree it started with.
+        (self.consumer / "vendor/vendor_replace.json").unlink()
         self.assertEqual(git(self.consumer, "status", "--porcelain"), "")
 
 
