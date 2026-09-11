@@ -29,7 +29,7 @@ After changing `vendor.py`, refresh the version comment at the top of the
 file with:
 
 ```sh
-./autoversion.py vendor.py
+./autoversion.py
 ```
 
 `autoversion.py` excludes the version comment from the SHA-256 checksum. When

@@ -17,6 +17,10 @@ VERSION_LINE = re.compile(
     rb"^(.*) v([\d.]+) \(([\d-]+)\) \(([\da-z]+)\)([ \-><]*)$"
 )
 
+# Resolve the target beside this utility so invocation does not depend on cwd.
+VENDOR_PATH = Path(__file__).resolve().with_name("vendor.py")
+
+
 def scanned_lines(contents):
     """Yield lines with the newline handling used by Go's bufio.Scanner."""
     offset = 0
@@ -92,18 +96,10 @@ def autoversion_file(path):
     return True
 
 
-def main(arguments=None):
-    """Run the command-line interface."""
-    arguments = sys.argv[1:] if arguments is None else arguments
-    if not arguments or len(arguments) == 1 and arguments[0] in ("-h", "--help"):
-        print(f"pass me a file, {HELP_TEXT}")
-        return 0
-    if len(arguments) > 1:
-        print("autoversion: expected at most one path", file=sys.stderr)
-        return 2
-
+def main():
+    """Autoversion the repository's vendor.py."""
     try:
-        autoversion_file(arguments[0])
+        autoversion_file(VENDOR_PATH)
     except (OSError, ValueError) as error:
         print(f"autoversion: {error}", file=sys.stderr)
         return 1

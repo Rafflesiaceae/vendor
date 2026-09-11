@@ -8,6 +8,7 @@ import unittest
 
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 import autoversion
 
@@ -53,6 +54,18 @@ class AutoversionTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "more than one version"):
                 autoversion.autoversion_file(path)
             self.assertEqual(path.read_bytes(), original)
+
+    def test_main_always_targets_vendor_file(self):
+        """The executable needs no path argument to update vendor.py."""
+        with tempfile.TemporaryDirectory(prefix="autoversion-") as directory:
+            path = Path(directory) / "vendor.py"
+            path.write_bytes(b"# vendor v1.0 (2020-01-01) (old)\ncontents\n")
+
+            with mock.patch.object(autoversion, "VENDOR_PATH", path):
+                with redirect_stdout(io.StringIO()):
+                    self.assertEqual(autoversion.main(), 0)
+
+            self.assertIn(b"# vendor v1.1 (", path.read_bytes())
 
 
 if __name__ == "__main__":
