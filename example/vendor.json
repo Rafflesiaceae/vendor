@@ -1,0 +1,12 @@
+[
+  {
+    "repo_url": "https://github.com/example/libfoo.git",
+    "name": "libfoo",
+    "rev": "v1.4.2"
+  },
+  {
+    "repo_url": "git@github.com:example/libbar.git",
+    "name": "libbar",
+    "rev": "9f1c2ab"
+  }
+]
