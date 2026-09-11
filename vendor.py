@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# vendor v0.4 (2026-09-11) (f9c6e107fde99515a2386950d9a4b81e8a49ea8d5846e07b129bd3efa36a6a49)
+# vendor v0.3 (2026-09-11) (f9c6e107fde99515)
 #
 # Updates vendor dependencies via git subtrees
 #

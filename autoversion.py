@@ -69,7 +69,8 @@ def autoversion_file(path):
         print(f"autoversion: no-version {path}\n\n{HELP_TEXT}")
         return False
 
-    checksum = hashlib.sha256(output).hexdigest().encode("ascii")
+    # Keep version metadata compact while retaining a strong content fingerprint.
+    checksum = hashlib.sha256(output).hexdigest()[:16].encode("ascii")
     if version_match.group(4) == checksum:
         print(f"autoversion: up-to-date {path}")
         return False
