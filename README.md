@@ -32,7 +32,7 @@ file with:
 ./autoversion.py vendor.py
 ```
 
-`autoversion.py` excludes the version comment from the XXH64 checksum. When
+`autoversion.py` excludes the version comment from the SHA-256 checksum. When
 the remaining content has changed, it increments the final version component
 and records the current date and checksum; otherwise it leaves the file alone.
 
