@@ -166,6 +166,17 @@ class VendorIntegrationTests(unittest.TestCase):
         """Invoke the copied script exactly as a consuming repository would."""
         return run([sys.executable, "vendor.py", *arguments], self.consumer)
 
+    def _run_vendor_result(self, *arguments):
+        """Invoke the script while preserving an expected failure result."""
+        return subprocess.run(
+            [sys.executable, "vendor.py", *arguments],
+            cwd=self.consumer,
+            env=COMMAND_ENV,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
     def _assert_release(self, revision):
         """Check that both vendored source files match a tagged release."""
         expected_fragments = {
@@ -196,6 +207,35 @@ class VendorIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(output.count("already at revision 'v1.0.0'"), 2)
         self.assertEqual(git(self.consumer, "status", "--porcelain"), "")
+
+    def test_dirty_worktree_reports_clean_error_without_traceback(self):
+        """Tracked changes explain why subtree cannot create its commit."""
+        # Dirty a tracked file without breaking the copy of vendor.py that the
+        # integration fixture is about to execute.
+        with (self.consumer / "vendor.py").open("a") as script:
+            script.write("\n# Local fixture change.\n")
+
+        result = self._run_vendor_result()
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "git subtree requires a clean index and working tree", result.stderr
+        )
+        self.assertIn(" M vendor.py", result.stderr)
+        self.assertIn("Commit or stash these tracked changes", result.stderr)
+        self.assertNotIn("Traceback", result.stdout + result.stderr)
+        self.assertNotIn("fatal: working tree has modifications", result.stderr)
+
+    def test_untracked_files_do_not_block_subtree_updates(self):
+        """Untracked files remain allowed, matching git subtree itself."""
+        (self.consumer / "local-notes.txt").write_text("Keep this untracked.\n")
+
+        self._run_vendor()
+
+        self._assert_release("v1.0.0")
+        self.assertEqual(
+            git(self.consumer, "status", "--porcelain"), "?? local-notes.txt"
+        )
 
     def test_upgrade_and_downgrade_leave_readable_history(self):
         """Changing pins in either direction updates content and clear history."""

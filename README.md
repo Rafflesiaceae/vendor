@@ -130,6 +130,9 @@ fetch step.
 
 ## Notes
 
+- Adding or updating a subtree requires a clean index and working tree because
+  `git subtree` creates a commit for the imported snapshot. Commit or stash
+  tracked changes first. Untracked files do not block an update.
 - The up-to-date check is a substring match on the last commit message, so
   short revisions that are prefixes of one another can collide. Prefer full
   commit hashes or unambiguous tags.
