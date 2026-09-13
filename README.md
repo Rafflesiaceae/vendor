@@ -23,6 +23,16 @@ Copy `vendor.py` into the root of your repository and run it from there:
 The script must be run from the repository root, since both the manifest path
 and the subtree prefixes are resolved relative to the current directory.
 
+Update the copied script itself to the latest version from the project's main
+branch with:
+
+```sh
+./vendor.py --update
+```
+
+The command reports the downloaded version and exits without reading the
+vendor manifest or changing any subtrees.
+
 ## Updating the script version
 
 After changing `vendor.py`, refresh the version comment at the top of the

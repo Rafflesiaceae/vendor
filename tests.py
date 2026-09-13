@@ -4,12 +4,18 @@
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import unittest
 
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
+from unittest import mock
+
+import vendor as vendor_module
 
 
 VENDOR_SCRIPT = Path(__file__).resolve().with_name("vendor.py")
@@ -28,6 +34,95 @@ COMMAND_ENV.update(
         "LC_ALL": "C",
     }
 )
+
+
+class DownloadResponse:
+    """Minimal context-managed response returned by the mocked downloader."""
+
+    def __init__(self, contents):
+        self.contents = contents
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exception_type, exception, traceback):
+        return False
+
+    def read(self):
+        """Return the complete mocked response body."""
+        return self.contents
+
+
+class SelfUpdateTests(unittest.TestCase):
+    """Exercise self-updates without accessing the network."""
+
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory(
+            prefix="vendor-self-update-"
+        )
+        self.script_path = Path(self.temporary_directory.name) / "vendor.py"
+        self.script_path.write_bytes(b"#!/usr/bin/env python3\nprint('old')\n")
+        self.script_path.chmod(0o751)
+        self.updated_contents = (
+            b"#!/usr/bin/env python3\n"
+            b"# vendor v9.8.7 (2026-09-13) (0123456789abcdef)\n"
+            b"print('new')\n"
+        )
+
+    def tearDown(self):
+        self.temporary_directory.cleanup()
+
+    def _run_update(self, contents=None):
+        """Run update_self against the fixture script and capture output."""
+        response = DownloadResponse(
+            self.updated_contents if contents is None else contents
+        )
+        output = StringIO()
+        with (
+            mock.patch.object(vendor_module, "__file__", str(self.script_path)),
+            mock.patch.object(
+                vendor_module.urllib.request,
+                "urlopen",
+                return_value=response,
+            ) as urlopen,
+            redirect_stdout(output),
+        ):
+            vendor_module.update_self()
+        return output.getvalue(), urlopen
+
+    def test_update_replaces_script_and_preserves_mode(self):
+        """A valid newer script atomically replaces the running file."""
+        output, urlopen = self._run_update()
+
+        self.assertEqual(self.script_path.read_bytes(), self.updated_contents)
+        self.assertEqual(stat.S_IMODE(self.script_path.stat().st_mode), 0o751)
+        self.assertEqual(output, "Updated vendor.py to v9.8.7.\n")
+        urlopen.assert_called_once_with(vendor_module.UPDATE_URL, timeout=30)
+
+    def test_current_script_reports_already_updated(self):
+        """An identical download leaves the script in place and says so."""
+        self.script_path.write_bytes(self.updated_contents)
+
+        output, _ = self._run_update()
+
+        self.assertEqual(output, "Already updated to v9.8.7.\n")
+
+    def test_invalid_download_does_not_replace_script(self):
+        """Content without the canonical version header is rejected."""
+        original_contents = self.script_path.read_bytes()
+
+        with self.assertRaisesRegex(ValueError, "no valid vendor version header"):
+            self._run_update(b"<!doctype html>upstream failure")
+
+        self.assertEqual(self.script_path.read_bytes(), original_contents)
+
+    def test_update_flag_exits_before_vendor_operations(self):
+        """The update flag does not require a repository or manifest."""
+        with mock.patch.object(vendor_module, "update_self") as update_self:
+            result = vendor_module.main(["--update"])
+
+        self.assertEqual(result, 0)
+        update_self.assert_called_once_with()
 
 
 def run(command, cwd):

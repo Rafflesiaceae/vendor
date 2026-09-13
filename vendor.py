@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# vendor v0.4 (2026-09-13) (1156f0efe39bd810)
+# vendor v0.5 (2026-09-14) (cb1ee8dbe509e26b)
 #
 # Updates vendor dependencies via git subtrees
 #
@@ -8,10 +8,13 @@
 # REQUIRES: python git
 import json
 import os
+import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
+import urllib.request
 
 from dataclasses import dataclass, asdict
 from typing import Dict, List
@@ -19,6 +22,13 @@ from typing import Dict, List
 VENDOR_DIR = "./vendor"
 VENDOR_JSON_PATH = "./vendor/vendor.json"
 VENDOR_REPLACE_JSON_PATH = "./vendor/vendor_replace.json"
+
+# Self-updates always follow the canonical script on the main branch.
+UPDATE_URL = (
+    "https://raw.githubusercontent.com/Rafflesiaceae/vendor/"
+    "refs/heads/main/vendor.py"
+)
+VERSION_HEADER = re.compile(rb"^# vendor v([0-9]+(?:\.[0-9]+)*)\b", re.MULTILINE)
 
 # Markers delimiting the section this script owns inside `.git/info/exclude`.
 # Everything between them is rewritten on every run, everything outside of
@@ -41,6 +51,53 @@ def run_cmd(cmd, cwd=None):
     except subprocess.CalledProcessError as e:
         print(f"Command failed: {' '.join(e.cmd)}")
         sys.exit(1)
+
+
+def update_self():
+    """Atomically replace this script with the latest canonical version."""
+    script_path = os.path.realpath(__file__)
+
+    # Reject an unexpected response before it can replace a working script.
+    with urllib.request.urlopen(UPDATE_URL, timeout=30) as response:
+        updated_contents = response.read()
+    version_match = VERSION_HEADER.search(updated_contents)
+    if version_match is None:
+        raise ValueError("downloaded script has no valid vendor version header")
+    try:
+        compile(updated_contents, UPDATE_URL, "exec")
+    except SyntaxError as error:
+        raise ValueError(f"downloaded script is not valid Python: {error}") from error
+
+    version = version_match.group(1).decode("ascii")
+    with open(script_path, "rb") as script:
+        if script.read() == updated_contents:
+            print(f"Already updated to v{version}.")
+            return
+
+    temporary_path = None
+    try:
+        # A sibling temporary file keeps os.replace atomic on the target
+        # filesystem, while copying the mode retains direct executability.
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=os.path.dirname(script_path),
+            prefix=f".{os.path.basename(script_path)}.",
+            delete=False,
+        ) as temporary:
+            temporary_path = temporary.name
+            temporary.write(updated_contents)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        mode = stat.S_IMODE(os.stat(script_path).st_mode)
+        os.chmod(temporary_path, mode)
+        os.replace(temporary_path, script_path)
+        temporary_path = None
+    finally:
+        # Clean up a partial sibling file when writing or replacing fails.
+        if temporary_path is not None and os.path.exists(temporary_path):
+            os.unlink(temporary_path)
+
+    print(f"Updated vendor.py to v{version}.")
 
 
 # --- replacements ---------------------------------------------------------
@@ -469,11 +526,17 @@ def load_vendor_config() -> List[VendorConfig]:
         return configs
 
 
-if __name__ == "__main__":
+def main(argv=None):
+    """Parse command-line arguments and run the requested operation."""
     import argparse
 
     parser = argparse.ArgumentParser(
         description="Manage git subtree based on vendor.json"
+    )
+    parser.add_argument(
+        "--update",
+        action="store_true",
+        help="update vendor.py itself from the latest version and exit",
     )
     parser.add_argument(
         "--restore-replacements",
@@ -489,21 +552,29 @@ if __name__ == "__main__":
         help="list the currently active replacements and exit",
     )
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+
+    if args.update:
+        try:
+            update_self()
+        except (OSError, ValueError) as error:
+            print(f"Cannot update vendor.py: {error}", file=sys.stderr)
+            return 1
+        return 0
 
     if args.status:
         print_replacement_status()
-        sys.exit(0)
+        return 0
 
     if args.restore_replacements:
         restore_all_replacements()
-        sys.exit(0)
+        return 0
 
     try:
         replacements = apply_replacements()
     except (ValueError, json.JSONDecodeError) as e:
         print(e)
-        sys.exit(1)
+        return 1
     if replacements:
         print()
 
@@ -511,7 +582,7 @@ if __name__ == "__main__":
         vendor_configs = load_vendor_config()
     except (FileNotFoundError, ValueError) as e:
         print(e)
-        sys.exit(1)
+        return 1
 
     print(f"Updating subtrees according to: '{VENDOR_JSON_PATH}'\n")
     for vendor in vendor_configs:
@@ -524,3 +595,8 @@ if __name__ == "__main__":
             )
             continue
         manage_subtree(vendor.repo_url, vendor.name, vendor.rev)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
