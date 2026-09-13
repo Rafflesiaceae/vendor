@@ -107,6 +107,16 @@ class SelfUpdateTests(unittest.TestCase):
 
         self.assertEqual(output, "Already updated to v9.8.7.\n")
 
+    def test_older_download_reports_downgrade(self):
+        """Replacing a newer local version identifies the downgrade."""
+        current_contents = self.updated_contents.replace(b"v9.8.7", b"v10.0.0")
+        self.script_path.write_bytes(current_contents)
+
+        output, _ = self._run_update()
+
+        self.assertEqual(self.script_path.read_bytes(), self.updated_contents)
+        self.assertEqual(output, "Downgraded vendor.py to v9.8.7.\n")
+
     def test_invalid_download_does_not_replace_script(self):
         """Content without the canonical version header is rejected."""
         original_contents = self.script_path.read_bytes()

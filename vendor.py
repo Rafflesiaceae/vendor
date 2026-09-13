@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# vendor v0.5 (2026-09-14) (cb1ee8dbe509e26b)
+# vendor v0.6 (2026-09-14) (bf312b6bbe0c697f)
 #
 # Updates vendor dependencies via git subtrees
 #
@@ -70,9 +70,26 @@ def update_self():
 
     version = version_match.group(1).decode("ascii")
     with open(script_path, "rb") as script:
-        if script.read() == updated_contents:
-            print(f"Already updated to v{version}.")
-            return
+        current_contents = script.read()
+    if current_contents == updated_contents:
+        print(f"Already updated to v{version}.")
+        return
+
+    update_action = "Updated"
+    current_version_match = VERSION_HEADER.search(current_contents)
+    if current_version_match is not None:
+        # Compare numeric components and treat omitted trailing zeroes as
+        # equivalent, so versions such as 1.10 and 1.9 sort correctly.
+        updated_parts = tuple(int(part) for part in version.split("."))
+        current_parts = tuple(
+            int(part)
+            for part in current_version_match.group(1).decode("ascii").split(".")
+        )
+        width = max(len(updated_parts), len(current_parts))
+        updated_key = updated_parts + (0,) * (width - len(updated_parts))
+        current_key = current_parts + (0,) * (width - len(current_parts))
+        if updated_key < current_key:
+            update_action = "Downgraded"
 
     temporary_path = None
     try:
@@ -97,7 +114,7 @@ def update_self():
         if temporary_path is not None and os.path.exists(temporary_path):
             os.unlink(temporary_path)
 
-    print(f"Updated vendor.py to v{version}.")
+    print(f"{update_action} vendor.py to v{version}.")
 
 
 # --- replacements ---------------------------------------------------------
