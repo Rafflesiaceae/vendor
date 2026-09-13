@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-# vendor v0.3 (2026-09-11) (f9c6e107fde99515)
+# vendor v0.4 (2026-09-13) (1156f0efe39bd810)
 #
 # Updates vendor dependencies via git subtrees
+#
+# https://github.com/Rafflesiaceae/vendor
 #
 # REQUIRES: python git
 import json
@@ -352,6 +354,32 @@ def is_subtree_up_to_date(target_path, rev):
         return False
 
 
+def require_clean_worktree_for_subtree(target_path):
+    """Exit cleanly when tracked changes would make git subtree refuse."""
+    # Match git subtree's cleanliness checks: tracked index and worktree
+    # changes matter, while unrelated untracked files are safe to leave alone.
+    result = subprocess.run(
+        ["git", "status", "--short", "--untracked-files=no"],
+        text=True,
+        stdout=subprocess.PIPE,
+        check=True,
+    )
+    if not result.stdout:
+        return
+
+    print(
+        f"Cannot update subtree at '{target_path}': git subtree requires "
+        "a clean index and working tree.",
+        file=sys.stderr,
+    )
+    print(result.stdout, end="", file=sys.stderr)
+    print(
+        "Commit or stash these tracked changes, then run vendor.py again.",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+
 def manage_subtree(repo_url, name, rev):
     target_path = os.path.join("vendor", name)
     print(f"Adding/updating subtree at {target_path}...")
@@ -362,32 +390,44 @@ def manage_subtree(repo_url, name, rev):
         )
         return
 
-    if os.path.exists(target_path):
-        subprocess.check_call(
-            [
-                "git",
-                "subtree",
-                "pull",
-                "--prefix",
-                target_path,
-                repo_url,
-                rev,
-                "--squash",
-            ]
+    require_clean_worktree_for_subtree(target_path)
+
+    try:
+        if os.path.exists(target_path):
+            subprocess.check_call(
+                [
+                    "git",
+                    "subtree",
+                    "pull",
+                    "--prefix",
+                    target_path,
+                    repo_url,
+                    rev,
+                    "--squash",
+                ]
+            )
+        else:
+            subprocess.check_call(
+                [
+                    "git",
+                    "subtree",
+                    "add",
+                    "--prefix",
+                    target_path,
+                    repo_url,
+                    rev,
+                    "--squash",
+                ]
+            )
+    except subprocess.CalledProcessError as error:
+        # Git has already printed the actionable cause; suppress Python's
+        # implementation-level traceback and add only the affected subtree.
+        print(
+            f"Failed to update subtree at '{target_path}' "
+            f"(git exited with status {error.returncode}).",
+            file=sys.stderr,
         )
-    else:
-        subprocess.check_call(
-            [
-                "git",
-                "subtree",
-                "add",
-                "--prefix",
-                target_path,
-                repo_url,
-                rev,
-                "--squash",
-            ]
-        )
+        raise SystemExit(1) from None
 
     commit_message = f"vendor: Upgraded {name} to '{rev}'"
 
