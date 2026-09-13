@@ -30,7 +30,8 @@ branch with:
 ./vendor.py --update
 ```
 
-The command reports the downloaded version and exits without reading the
+The command reports whether the script was already current, updated, or
+downgraded, along with the downloaded version. It exits without reading the
 vendor manifest or changing any subtrees.
 
 ## Updating the script version
