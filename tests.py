@@ -53,6 +53,31 @@ class DownloadResponse:
         return self.contents
 
 
+class ExcludeConfigTests(unittest.TestCase):
+    """Validate optional exclusion rules before any subtree operation."""
+
+    def test_default_exclusions_are_independent_empty_lists(self):
+        """Existing configurations need no extra field or shared defaults."""
+        first = vendor_module.VendorConfig("url", "first", "v1")
+        second = vendor_module.VendorConfig("url", "second", "v1")
+        first.exclude.append("docs/")
+        self.assertEqual(second.exclude, [])
+
+    def test_invalid_exclusions_are_rejected(self):
+        """Reject non-lists, non-strings, and injected gitignore lines."""
+        for patterns in (None, "docs/", {}, [1], ["docs/\n*.c"], ["a\rb"], ["a\0b"]):
+            with self.subTest(patterns=patterns):
+                with self.assertRaisesRegex(ValueError, "list of single-line strings"):
+                    vendor_module.VendorConfig("url", "library", "v1", patterns)
+
+    def test_missing_filter_repo_reports_requirement(self):
+        """A configured filter fails clearly without an optional tool."""
+        with mock.patch.object(vendor_module.shutil, "which", return_value=None):
+            with self.assertRaisesRegex(ValueError, "requires git-filter-repo"):
+                with vendor_module.filtered_repository("url", "v1", ["docs/"]):
+                    self.fail("filtering must not proceed without git-filter-repo")
+
+
 class SelfUpdateTests(unittest.TestCase):
     """Exercise self-updates without accessing the network."""
 
@@ -247,6 +272,312 @@ class VendorIntegrationTests(unittest.TestCase):
             json.dumps(manifest, indent=2) + "\n"
         )
 
+    def _write_exclusion_manifest(self, revision, patterns):
+        """Commit rules as a consumer would before invoking vendor.py."""
+        self._write_manifest(revision)
+        manifest_path = self.consumer / "vendor/vendor.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest[0]["exclude"] = patterns
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+        commit_all(self.consumer, f"Configure {revision} exclusions")
+
+    def _prepare_exclusion_source(self):
+        """Create releases with kept files, ignored files, and excluded-only edits."""
+        repository = self.sources["libanswer"]
+        self.sources = {"libanswer": repository}
+        files = {
+            "docs/guide.txt": "Documentation v1\n",
+            "nested/docs/guide.txt": "Nested documentation\n",
+            "root-only.txt": "Root file\n",
+            "nested/root-only.txt": "Nested file stays\n",
+            "remove.tmp": "Temporary file\n",
+            "nested/line\nbreak.tmp": "Unusual filename\n",
+            "keep.tmp": "Negated exclusion\n",
+            "assets/generated1.c": "Generated file\n",
+            "assets/deep/generated2.h": "Nested generated file\n",
+            "assets/generated1.cc": "Different extension stays\n",
+            "samples/remove.c": "Sample\n",
+            "samples/keep.c": "Kept sample\n",
+            "#notes": "Escaped comment\n",
+            "!notice": "Escaped negation\n",
+            "trailing ": "Significant trailing space\n",
+            ".gitignore": "ignored-by-upstream.txt\n",
+            "ignored-by-upstream.txt": "Tracked upstream despite ignore\n",
+            "case-only": "Case-sensitive patterns\n",
+        }
+        for relative, contents in files.items():
+            path = repository / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(contents)
+        git(repository, "add", "-f", "ignored-by-upstream.txt")
+        commit_all(repository, "Add filtering fixture")
+        git(repository, "tag", "filtered-v1")
+
+        # Keep local edits on a separate line from the upstream change so a
+        # proper three-way subtree merge can preserve both without conflicts.
+        (repository / "libanswer.c").write_text(
+            (repository / "libanswer.c").read_text().replace("return 42;", "return 43;")
+        )
+        (repository / "docs/guide.txt").write_text("Documentation v2\n")
+        (repository / "docs/new.txt").write_text("New documentation\n")
+        (repository / "remove.tmp").unlink()
+        commit_all(repository, "Update retained and excluded paths")
+        git(repository, "tag", "filtered-v2")
+
+        (repository / "docs/guide.txt").write_text("Documentation v3\n")
+        commit_all(repository, "Change excluded documentation only")
+        git(repository, "tag", "filtered-v3")
+        return repository
+
+    def _clone_consumer(self):
+        """Clone without borrowing unreachable split objects from the source."""
+        destination = self.root / "fresh-consumer"
+        run(["git", "clone", "--no-local", self.consumer, destination], self.root)
+        self.consumer = destination
+
+    @unittest.skipUnless(shutil.which("git-filter-repo"), "requires git-filter-repo")
+    def test_gitignore_exclusions_and_filtered_updates_preserve_local_edits(self):
+        """Use real gitignore semantics and preserve edits across filtered pulls."""
+        repository = self._prepare_exclusion_source()
+        upstream_head = git(repository, "rev-parse", "HEAD")
+        patterns = [
+            "docs/", "/root-only.txt", "*.tmp", "!keep.tmp",
+            "/assets/**/generated?.[ch]", "/samples/*", "!/samples/keep.c",
+            r"\#notes", r"\!notice", "trailing\\ ", "CASE-ONLY",
+        ]
+        self._write_exclusion_manifest("filtered-v1", patterns)
+        # User ignore settings must not change filtered history or strip
+        # tracked headers; the manifest defines a reproducible filter.
+        user_ignores = self.root / "user-ignore"
+        user_ignores.write_text("*.h\n")
+        with mock.patch.dict(COMMAND_ENV, {
+            "GIT_CONFIG_COUNT": "2",
+            "GIT_CONFIG_KEY_0": "core.excludesFile",
+            "GIT_CONFIG_VALUE_0": str(user_ignores),
+            "GIT_CONFIG_KEY_1": "core.ignoreCase",
+            "GIT_CONFIG_VALUE_1": "true",
+        }):
+            self._run_vendor()
+        self.assertEqual(
+            git(self.consumer, "log", "-1", "--format=%B"),
+            "vendor: Upgraded libanswer to 'filtered-v1'",
+        )
+        first_split = git(
+            self.consumer, "log", "-1", "--format=%B",
+            "--grep=^git-subtree-dir: vendor/libanswer$",
+        ).split("git-subtree-split: ")[1].splitlines()[0]
+        subtree = self.consumer / "vendor/libanswer"
+        for relative in (
+            "docs", "nested/docs", "root-only.txt", "remove.tmp",
+            "nested/line\nbreak.tmp", "assets/generated1.c",
+            "assets/deep/generated2.h", "samples/remove.c", "#notes", "!notice",
+            "trailing ",
+        ):
+            with self.subTest(excluded=relative):
+                self.assertFalse((subtree / relative).exists())
+        for relative in (
+            "nested/root-only.txt", "keep.tmp", "assets/generated1.cc",
+            "samples/keep.c", "ignored-by-upstream.txt", "case-only", "libanswer.h",
+        ):
+            with self.subTest(retained=relative):
+                self.assertTrue((subtree / relative).is_file())
+
+        # A local header edit must survive an upstream implementation update.
+        header = subtree / "libanswer.h"
+        header.write_text(header.read_text() + "\n/* Consumer customization. */\n")
+        commit_all(self.consumer, "Customize vendored header")
+        for revision in ("filtered-v2", "filtered-v3"):
+            self._write_exclusion_manifest(revision, patterns)
+            self._run_vendor()
+            self.assertEqual(
+                git(self.consumer, "log", "-1", "--format=%B"),
+                f"vendor: Upgraded libanswer to '{revision}'",
+            )
+            self.assertFalse((subtree / "docs").exists())
+            self.assertIn("return 43;", (subtree / "libanswer.c").read_text())
+            self.assertIn("Consumer customization", header.read_text())
+
+        # The filtered history itself retains the same original ancestor,
+        # rather than merely producing the right worktree by replacing files.
+        latest_split = git(
+            self.consumer, "log", "-1", "--format=%B",
+            "--grep=^git-subtree-dir: vendor/libanswer$",
+        ).split("git-subtree-split: ")[1].splitlines()[0]
+        git(self.consumer, "merge-base", "--is-ancestor", first_split, latest_split)
+
+        head = git(self.consumer, "rev-parse", "HEAD")
+        self.assertIn("already at revision", self._run_vendor())
+        self.assertEqual(git(self.consumer, "rev-parse", "HEAD"), head)
+        self.assertEqual(git(self.consumer, "status", "--porcelain"), "")
+        self.assertEqual(git(repository, "rev-parse", "HEAD"), upstream_head)
+        self.assertTrue((repository / "docs/guide.txt").is_file())
+
+    @unittest.skipUnless(shutil.which("git-filter-repo"), "requires git-filter-repo")
+    def test_filtered_upgrade_and_downgrade_after_fresh_clone(self):
+        """Reconstruct missing split commits for upgrades and reverse updates."""
+        self._prepare_exclusion_source()
+        self._write_exclusion_manifest("filtered-v1", ["docs/"])
+        self._run_vendor()
+        self._clone_consumer()
+        self._write_exclusion_manifest("filtered-v2", ["docs/"])
+        self._run_vendor()
+        self.assertIn("return 43;", (self.consumer / "vendor/libanswer/libanswer.c").read_text())
+
+        # A different destination guarantees the downgrade starts without
+        # unreachable filtered objects left by any prior invocation.
+        previous_consumer = self.consumer
+        self.consumer = self.root / "downgrade-consumer"
+        run(["git", "clone", "--no-local", previous_consumer, self.consumer], self.root)
+        self._write_exclusion_manifest("filtered-v1", ["docs/"])
+        self._run_vendor()
+        self.assertIn("return 42;", (self.consumer / "vendor/libanswer/libanswer.c").read_text())
+        self.assertFalse((self.consumer / "vendor/libanswer/docs").exists())
+        self.assertEqual(git(self.consumer, "status", "--porcelain"), "")
+
+    @unittest.skipUnless(shutil.which("git-filter-repo"), "requires git-filter-repo")
+    def test_changing_rules_at_same_revision_including_empty_subtree(self):
+        """Add, change, and remove rules without losing subtree ancestry."""
+        self._prepare_exclusion_source()
+        for patterns in ([], ["docs/"], ["*.tmp"], ["*"], [], ["absent-path"]):
+            with self.subTest(patterns=patterns):
+                self._write_exclusion_manifest("filtered-v1", patterns)
+                manifest_commit = git(self.consumer, "rev-parse", "HEAD")
+                self._run_vendor()
+                head = git(self.consumer, "rev-parse", "HEAD")
+                self.assertNotEqual(head, manifest_commit)
+                self.assertEqual(
+                    git(self.consumer, "log", "-1", "--format=%B"),
+                    "vendor: Upgraded libanswer to 'filtered-v1'",
+                )
+                subtree = self.consumer / "vendor/libanswer"
+                if patterns == ["*"]:
+                    self.assertEqual(git(self.consumer, "ls-files", "vendor/libanswer"), "")
+                else:
+                    self.assertEqual((subtree / "docs/guide.txt").exists(), "docs/" not in patterns)
+                self.assertIn("already at revision", self._run_vendor())
+                self.assertEqual(git(self.consumer, "rev-parse", "HEAD"), head)
+                self.assertEqual(git(self.consumer, "status", "--porcelain"), "")
+
+    @unittest.skipUnless(shutil.which("git-filter-repo"), "requires git-filter-repo")
+    def test_rule_change_after_clone_rebuilds_previous_filter(self):
+        """A different rule set must not prevent restoring the old merge base."""
+        self._prepare_exclusion_source()
+        self._write_exclusion_manifest("filtered-v1", ["docs/"])
+        self._run_vendor()
+        self._clone_consumer()
+        self._write_exclusion_manifest("filtered-v1", ["*.tmp"])
+        self._run_vendor()
+        subtree = self.consumer / "vendor/libanswer"
+        self.assertTrue((subtree / "docs/guide.txt").is_file())
+        self.assertFalse((subtree / "remove.tmp").exists())
+        self.assertEqual(git(self.consumer, "status", "--porcelain"), "")
+
+    @unittest.skipUnless(shutil.which("git-filter-repo"), "requires git-filter-repo")
+    def test_existing_import_accepts_exclusions_with_relative_upstream_url(self):
+        """Filter an existing unfiltered import with a relative upstream URL."""
+        repository = self._prepare_exclusion_source()
+        self.sources["libanswer"] = Path(os.path.relpath(repository, self.consumer))
+        self._write_exclusion_manifest("filtered-v1", [])
+        self._run_vendor()
+
+        # Clone so the original unfiltered split object is absent locally.
+        self._clone_consumer()
+        self._write_exclusion_manifest("filtered-v1", ["docs/"])
+        self._run_vendor()
+        subtree = self.consumer / "vendor/libanswer"
+        self.assertTrue((subtree / "libanswer.c").is_file())
+        self.assertFalse((subtree / "docs").exists())
+        self.assertEqual(git(self.consumer, "status", "--porcelain"), "")
+
+    @unittest.skipUnless(shutil.which("git-filter-repo"), "requires git-filter-repo")
+    def test_untracked_manifest_allows_repeated_updates(self):
+        """An untracked manifest must support both plain and filtered imports."""
+        repository = self._prepare_exclusion_source()
+        # A second name for the same commit still needs its own import
+        # message, even though git subtree has no new content to merge.
+        git(repository, "tag", "filtered-alias", "filtered-v2")
+        # Leave the manifest on disk without including it in import history,
+        # matching consumers that keep their vendoring configuration local.
+        git(self.consumer, "rm", "--cached", "vendor/vendor.json")
+        git(self.consumer, "commit", "-m", "Keep the vendor manifest local")
+
+        for patterns in ([], ["docs/"]):
+            for revision in ("filtered-v1", "filtered-v2", "filtered-alias"):
+                with self.subTest(patterns=patterns, revision=revision):
+                    self._write_manifest(revision)
+                    manifest_path = self.consumer / "vendor/vendor.json"
+                    manifest = json.loads(manifest_path.read_text())
+                    manifest[0]["exclude"] = patterns
+                    manifest_path.write_text(json.dumps(manifest) + "\n")
+                    self._run_vendor()
+                    self.assertEqual(
+                        git(self.consumer, "log", "-1", "--format=%B"),
+                        f"vendor: Upgraded libanswer to '{revision}'",
+                    )
+                    subtree = self.consumer / "vendor/libanswer"
+                    self.assertEqual((subtree / "docs").exists(), not patterns)
+                    implementation = "return 42;" if revision == "filtered-v1" else "return 43;"
+                    self.assertIn(implementation, (subtree / "libanswer.c").read_text())
+
+                    head = git(self.consumer, "rev-parse", "HEAD")
+                    if not patterns and revision == "filtered-v1":
+                        original_import = head
+                    # An unchanged import must not fetch or filter upstream
+                    # again, even when the manifest was never committed.
+                    offline = repository.with_name(repository.name + "-offline")
+                    repository.rename(offline)
+                    try:
+                        self._run_vendor()
+                    finally:
+                        offline.rename(repository)
+                    self.assertEqual(git(self.consumer, "rev-parse", "HEAD"), head)
+                    self.assertEqual(
+                        git(self.consumer, "status", "--porcelain"),
+                        "?? vendor/vendor.json",
+                    )
+
+        # Switching history must invalidate the latest cached import rather
+        # than skipping updates to the older files now in the worktree.
+        git(self.consumer, "checkout", "--detach", original_import)
+        self._run_vendor()
+        subtree = self.consumer / "vendor/libanswer"
+        self.assertIn("return 43;", (subtree / "libanswer.c").read_text())
+        self.assertFalse((subtree / "docs").exists())
+
+    @unittest.skipUnless(shutil.which("git-filter-repo"), "requires git-filter-repo")
+    def test_manifest_committed_after_import_skips_upstream(self):
+        """Use the first tracked manifest for imports predating that file."""
+        repository = self._prepare_exclusion_source()
+        git(self.consumer, "rm", "--cached", "vendor/vendor.json")
+        git(self.consumer, "commit", "-m", "Keep the vendor manifest local")
+        self._write_manifest("filtered-v1")
+        manifest_path = self.consumer / "vendor/vendor.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest[0]["exclude"] = ["docs/"]
+        manifest_path.write_text(json.dumps(manifest) + "\n")
+        self._run_vendor()
+        commit_all(self.consumer, "Track the vendor manifest after importing")
+        self._clone_consumer()
+
+        # A fresh clone has no local import cache or upstream split objects.
+        # Taking upstream offline proves the skip happens before filtering.
+        head = git(self.consumer, "rev-parse", "HEAD")
+        offline = repository.with_name(repository.name + "-offline")
+        repository.rename(offline)
+        try:
+            self.assertIn("already at revision", self._run_vendor())
+        finally:
+            offline.rename(repository)
+        self.assertEqual(git(self.consumer, "rev-parse", "HEAD"), head)
+
+        # Later manifest edits must still be compared with the first snapshot
+        # rather than being mistaken for settings used by the old import.
+        self._write_exclusion_manifest("filtered-v1", ["*.tmp"])
+        self._run_vendor()
+        subtree = self.consumer / "vendor/libanswer"
+        self.assertTrue((subtree / "docs/guide.txt").is_file())
+        self.assertFalse((subtree / "remove.tmp").exists())
+
     def _create_local_checkout(self, name, source_text):
         """Create a local checkout whose content differs from every release."""
         checkout = self.root / f"{name}-checkout"
@@ -303,6 +634,11 @@ class VendorIntegrationTests(unittest.TestCase):
         """A fresh run vendors every library and a repeated run is a no-op."""
         self._run_vendor()
         self._assert_release("v1.0.0")
+        self.assertEqual(
+            git(self.consumer, "log", "--first-parent", "-2", "--format=%B"),
+            "vendor: Upgraded libgreet to 'v1.0.0'\n\n"
+            "vendor: Upgraded libanswer to 'v1.0.0'",
+        )
         head_after_first_run = git(self.consumer, "rev-parse", "HEAD")
 
         output = self._run_vendor()

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# vendor v0.7 (2026-10-20) (2161bc3cedec6fce)
+# vendor v0.14 (2026-10-20) (c20dc7ffef0ba03f)
 #
 # Updates vendor dependencies via git subtrees
 #
@@ -16,7 +16,8 @@ import sys
 import tempfile
 import urllib.request
 
-from dataclasses import dataclass, asdict
+from contextlib import contextmanager
+from dataclasses import dataclass, asdict, field
 from typing import Dict, List
 
 VENDOR_DIR = "./vendor"
@@ -42,6 +43,19 @@ class VendorConfig:
     repo_url: str
     name: str
     rev: str
+    exclude: List[str] = field(default_factory=list)
+
+    def __post_init__(self):
+        # Each item represents exactly one gitignore rule, including escapes
+        # and negation; reject separators that would inject additional rules.
+        if not isinstance(self.exclude, list) or any(
+            not isinstance(pattern, str)
+            or any(separator in pattern for separator in ("\n", "\r", "\0"))
+            for pattern in self.exclude
+        ):
+            raise ValueError(
+                f"'exclude' for '{self.name}' must be a list of single-line strings"
+            )
 
 
 def run_cmd(cmd, cwd=None):
@@ -418,7 +432,311 @@ def print_replacement_status():
         print(f"  {name} -> {entry['path']}{suffix}")
 
 
-def is_subtree_up_to_date(target_path, rev):
+def last_vendor_import_commit(name):
+    """Find the latest import independently of excluded or empty paths."""
+    return run_cmd(
+        [
+            "git",
+            "log",
+            "--first-parent",
+            "-1",
+            "--format=%H",
+            "--extended-regexp",
+            f"--grep=^vendor: Upgraded {re.escape(name)} to '",
+            "HEAD",
+            "--",
+        ]
+    )
+
+
+def load_vendor_imports():
+    """Read local import settings without requiring a tracked manifest."""
+    path = os.path.join(git_dir(), "vendor_imports.json")
+    try:
+        with open(path) as state:
+            return json.load(state)
+    except (FileNotFoundError, json.JSONDecodeError):
+        # This is a cache; a missing or interrupted write can be rebuilt.
+        return {}
+
+
+def remember_vendor_import(name, repo_url, rev, exclude):
+    """Remember validated settings for this dependency's current import."""
+    imports = load_vendor_imports()
+    imports[name] = {
+        "commit": last_vendor_import_commit(name),
+        "settings": dict(name=name, repo_url=repo_url, rev=rev, exclude=exclude),
+    }
+    with open(os.path.join(git_dir(), "vendor_imports.json"), "w") as state:
+        json.dump(imports, state, indent=2, sort_keys=True)
+        state.write("\n")
+
+
+def last_vendor_import(name):
+    """Read import settings from local state or committed manifests."""
+    commit = last_vendor_import_commit(name)
+    if not commit:
+        return None
+    # Tie cached rules to the actual import, so checking out another history
+    # cannot reuse settings belonging to a different dependency snapshot.
+    cached = load_vendor_imports().get(name)
+    if cached is not None and cached["commit"] == commit:
+        return cached["settings"]
+    manifest_path = VENDOR_JSON_PATH.removeprefix("./")
+    result = subprocess.run(
+        [
+            "git",
+            "show",
+            f"{commit}:{manifest_path}",
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        # Older consumers may have committed the manifest after importing.
+        # Use its first snapshot, preserving later rule edits as updates.
+        snapshots = run_cmd(
+            [
+                "git",
+                "log",
+                "--first-parent",
+                "--reverse",
+                "--format=%H",
+                "--diff-filter=A",
+                f"{commit}..HEAD",
+                "--",
+                manifest_path,
+            ]
+        ).splitlines()
+        if not snapshots:
+            return None
+        manifest = json.loads(
+            run_cmd(
+                [
+                    "git",
+                    "show",
+                    f"{snapshots[0]}:{manifest_path}",
+                ]
+            )
+        )
+        subject = run_cmd(["git", "show", "-s", "--format=%s", commit])
+        # A manifest first tracked at a newer revision cannot describe the
+        # earlier import, even if it already matches the current manifest.
+        manifest = [
+            entry
+            for entry in manifest
+            if subject == f"vendor: Upgraded {name} to '{entry['rev']}'"
+        ]
+    else:
+        manifest = json.loads(result.stdout)
+    for entry in manifest:
+        if entry["name"] == name:
+            return dict(entry, exclude=entry.get("exclude", []))
+    return None
+
+
+def last_subtree_split(target_path):
+    """Find the source commit referenced by the latest subtree squash."""
+    message = run_cmd(
+        [
+            "git",
+            "log",
+            "-1",
+            "--format=%B",
+            "--extended-regexp",
+            f"--grep=^git-subtree-dir: {re.escape(target_path)}/*$",
+            "HEAD",
+            "--",
+        ]
+    )
+    for line in message.splitlines():
+        if line.startswith("git-subtree-split: "):
+            return line.split(": ", 1)[1]
+    return None
+
+
+@contextmanager
+def filtered_repository(repo_url, rev, patterns):
+    """Filter a disposable upstream history, yielding repo, ref, source SHA."""
+    if not patterns:
+        yield repo_url, rev, None
+        return
+    if shutil.which("git-filter-repo") is None:
+        raise ValueError("'exclude' requires git-filter-repo on PATH")
+    # Local URLs are resolved from the consumer, before changing cwd to the
+    # temporary bare repository used for fetching and filtering.
+    if os.path.exists(repo_url):
+        repo_url = os.path.abspath(repo_url)
+
+    with tempfile.TemporaryDirectory(prefix="vendor-filter-") as temporary:
+        repository = os.path.join(temporary, "upstream.git")
+        subprocess.check_call(["git", "init", "--bare", "--quiet", repository])
+        subprocess.check_call(
+            [
+                "git",
+                "-C",
+                repository,
+                "fetch",
+                "--no-tags",
+                repo_url,
+                rev,
+            ]
+        )
+        source = run_cmd(
+            [
+                "git",
+                "rev-parse",
+                "FETCH_HEAD^{commit}",
+            ],
+            cwd=repository,
+        )
+        subprocess.check_call(
+            [
+                "git",
+                "-C",
+                repository,
+                "update-ref",
+                "refs/heads/vendor",
+                source,
+            ]
+        )
+        subprocess.check_call(
+            [
+                "git",
+                "-C",
+                repository,
+                "symbolic-ref",
+                "HEAD",
+                "refs/heads/vendor",
+            ]
+        )
+
+        # Ask Git to interpret the manifest as the only ignore file in an
+        # empty worktree. Upstream .gitignores and user exclusions must not
+        # influence filtering. Checking every historical filename also drops
+        # deleted paths and keeps directory-only rules distinct from files.
+        matcher = os.path.join(temporary, "matcher")
+        subprocess.check_call(["git", "init", "--quiet", matcher])
+        with open(os.path.join(matcher, ".git", "info", "exclude"), "w") as rules:
+            rules.write("\n".join(patterns) + "\n")
+        paths = subprocess.check_output(
+            [
+                "git",
+                "log",
+                "--format=",
+                "--name-only",
+                "-z",
+                "--no-renames",
+                "-m",
+                "--root",
+                "HEAD",
+                "--",
+            ],
+            cwd=repository,
+        )
+        paths = b"\0".join(sorted(set(paths.split(b"\0")) - {b""}))
+        matches = subprocess.run(
+            [
+                "git",
+                "-C",
+                matcher,
+                "-c",
+                f"core.excludesFile={os.devnull}",
+                "-c",
+                "core.ignoreCase=false",
+                "check-ignore",
+                "--no-index",
+                "--stdin",
+                "-z",
+            ],
+            input=paths + b"\0" if paths else b"",
+            stdout=subprocess.PIPE,
+        )
+        if matches.returncode not in (0, 1):
+            matches.check_returncode()
+        excluded_path = os.path.join(temporary, "excluded-paths")
+        with open(excluded_path, "wb") as excluded:
+            excluded.write(matches.stdout)
+
+        # Load the NUL-delimited byte paths once inside filter-repo. This
+        # handles unusual filenames and avoids command-line length limits.
+        callback = (
+            "global vendor_excluded_paths\n"
+            "try:\n"
+            "    vendor_excluded_paths\n"
+            "except NameError:\n"
+            f"    with open({excluded_path!r}, 'rb') as paths:\n"
+            "        vendor_excluded_paths = set(paths.read().split(b'\\0'))\n"
+            "return None if filename in vendor_excluded_paths else filename\n"
+        )
+        # Preserve topology and messages so the same ancestor hashes are
+        # reproduced when filtering another revision or rebuilding a clone.
+        # --force applies exclusively to the disposable repository above.
+        subprocess.check_call(
+            [
+                "git",
+                "-C",
+                repository,
+                "filter-repo",
+                "--force",
+                "--prune-empty",
+                "never",
+                "--prune-degenerate",
+                "never",
+                "--preserve-commit-hashes",
+                "--filename-callback",
+                callback,
+            ]
+        )
+        yield repository, "refs/heads/vendor", source
+
+
+def restore_subtree_split(repo_url, previous, split, filtered=None):
+    """Rebuild an unreferenced split object lost during clone or Git GC."""
+    if not split:
+        return
+    exists = subprocess.run(
+        ["git", "cat-file", "-e", f"{split}^{{commit}}"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if exists.returncode == 0:
+        return
+    if filtered is not None:
+        # A normal upgrade with unchanged rules already contains the old
+        # filtered ancestor. The upcoming subtree fetch will restore it, so
+        # avoid fetching and filtering the same upstream history twice.
+        exists = subprocess.run(
+            ["git", "-C", filtered, "cat-file", "-e", f"{split}^{{commit}}"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if exists.returncode == 0:
+            return
+
+    if previous and previous["exclude"]:
+        with filtered_repository(
+            previous["repo_url"], previous["rev"], previous["exclude"]
+        ) as (repository, ref, _):
+            rebuilt = run_cmd(["git", "rev-parse", ref], cwd=repository)
+            if rebuilt != split:
+                raise ValueError("could not reproduce the previous filtered subtree")
+            subprocess.check_call(["git", "fetch", "--no-tags", repository, ref])
+    else:
+        # Older imports and imports without exclusions reference the original
+        # upstream commit, which can be fetched directly without filtering.
+        subprocess.check_call(["git", "fetch", "--no-tags", repo_url, split])
+
+
+def is_subtree_up_to_date(target_path, rev, exclude=None):
+    previous = last_vendor_import(os.path.relpath(target_path, "vendor"))
+    if previous is not None:
+        return previous["rev"] == rev and previous["exclude"] == (exclude or [])
+    # Existing manifests and pre-feature imports retain their old skip check;
+    # adding any exclusion must still perform the first filtered import.
+    if exclude:
+        return False
     if not os.path.exists(target_path):
         return False
     try:
@@ -454,11 +772,12 @@ def require_clean_worktree_for_subtree(target_path):
     raise SystemExit(1)
 
 
-def manage_subtree(repo_url, name, rev):
+def manage_subtree(repo_url, name, rev, exclude=None):
     target_path = os.path.join("vendor", name)
     print(f"Adding/updating subtree at {target_path}...")
 
-    if is_subtree_up_to_date(target_path, rev):
+    exclude = exclude or []
+    if is_subtree_up_to_date(target_path, rev, exclude):
         print(
             f"Subtree at '{target_path}' is already at revision '{rev}', skipping update."
         )
@@ -466,33 +785,35 @@ def manage_subtree(repo_url, name, rev):
 
     require_clean_worktree_for_subtree(target_path)
 
+    previous = last_vendor_import(name)
+    split = last_subtree_split(target_path)
+    head_before = run_cmd(["git", "rev-parse", "HEAD"])
     try:
-        if os.path.exists(target_path):
+        with filtered_repository(repo_url, rev, exclude) as (repository, ref, _):
+            restore_subtree_split(
+                repo_url, previous, split, repository if exclude else None
+            )
+            # An empty import has no tracked prefix. Start a new squash when
+            # adding content again: pulling into a missing tree can make Git
+            # put upstream files at the consumer root instead of the prefix.
+            if split and os.path.isdir(target_path) and not os.listdir(target_path):
+                os.rmdir(target_path)
+            operation = "pull" if os.path.exists(target_path) else "add"
             subprocess.check_call(
                 [
                     "git",
                     "subtree",
-                    "pull",
+                    operation,
                     "--prefix",
                     target_path,
-                    repo_url,
-                    rev,
+                    repository,
+                    ref,
                     "--squash",
                 ]
             )
-        else:
-            subprocess.check_call(
-                [
-                    "git",
-                    "subtree",
-                    "add",
-                    "--prefix",
-                    target_path,
-                    repo_url,
-                    rev,
-                    "--squash",
-                ]
-            )
+    except ValueError as error:
+        print(f"Cannot update subtree at '{target_path}': {error}", file=sys.stderr)
+        raise SystemExit(1) from None
     except subprocess.CalledProcessError as error:
         # Git has already printed the actionable cause; suppress Python's
         # implementation-level traceback and add only the affected subtree.
@@ -503,15 +824,48 @@ def manage_subtree(repo_url, name, rev):
         )
         raise SystemExit(1) from None
 
-    commit_message = f"vendor: Upgraded {name} to '{rev}'"
+    changed = run_cmd(["git", "rev-parse", "HEAD"]) != head_before
+    # Without historical settings, filtered imports are checked by subtree
+    # itself. An unchanged import has nothing new to record on repeated runs.
+    if not changed and previous is None:
+        last_message = run_cmd(
+            [
+                "git",
+                "log",
+                "--first-parent",
+                "-1",
+                "--format=%s",
+                "--extended-regexp",
+                f"--grep=^vendor: Upgraded {re.escape(name)} to '",
+                "HEAD",
+                "--",
+            ]
+        )
+        if last_message == f"vendor: Upgraded {name} to '{rev}'":
+            remember_vendor_import(name, repo_url, rev, exclude)
+            print(
+                f"Subtree at '{target_path}' is already at revision '{rev}', skipping update."
+            )
+            return
+
+    commit_message = f"vendor: Upgraded {name} to '{rev}'\n"
 
     with tempfile.NamedTemporaryFile(mode="w+", delete=False) as tmpfile:
         tmpfile.write(commit_message)
         tmpfile_path = tmpfile.name
 
     try:
+        # A rule change may produce the same filtered commit. Record it in a
+        # new empty commit rather than amending an unrelated existing commit.
         subprocess.check_call(
-            ["git", "commit", "--amend", "--edit", "-F", tmpfile_path]
+            [
+                "git",
+                "commit",
+                "--amend" if changed else "--allow-empty",
+                "--edit",
+                "-F",
+                tmpfile_path,
+            ]
         )
     except subprocess.CalledProcessError:
         print(f"Failed to amend commit for subtree at {target_path}.")
@@ -519,6 +873,7 @@ def manage_subtree(repo_url, name, rev):
     finally:
         os.unlink(tmpfile_path)
 
+    remember_vendor_import(name, repo_url, rev, exclude)
     print(f"Subtree at '{target_path}' is now at revision '{rev}'.\n")
 
 
@@ -611,7 +966,7 @@ def main(argv=None):
                 f"'{replacements[vendor.name]}'.\n"
             )
             continue
-        manage_subtree(vendor.repo_url, vendor.name, vendor.rev)
+        manage_subtree(vendor.repo_url, vendor.name, vendor.rev, vendor.exclude)
     return 0
 
 

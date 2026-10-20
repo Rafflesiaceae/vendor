@@ -11,6 +11,7 @@ build time.
 
 - Python 3 (standard library only)
 - `git` (with `git subtree` available)
+- `git-filter-repo` on `PATH` when any dependency uses `exclude`
 
 ## Usage
 
@@ -57,7 +58,8 @@ requires all three fields:
   {
     "repo_url": "https://github.com/example/libfoo.git",
     "name": "libfoo",
-    "rev": "v1.4.2"
+    "rev": "v1.4.2",
+    "exclude": ["docs/", "tests/", "*.pdf"]
   },
   {
     "repo_url": "git@github.com:example/libbar.git",
@@ -72,6 +74,52 @@ requires all three fields:
 | `repo_url` | Any URL `git` can clone from.                                     |
 | `name`     | Directory name of the subtree, created at `vendor/<name>`.        |
 | `rev`      | Revision to pull — a tag, branch, or commit-ish `git` understands. |
+| `exclude`  | Optional list of gitignore patterns to remove before importing. Defaults to `[]`. |
+
+### Excluding upstream paths
+
+Set `exclude` independently for each dependency. Patterns follow
+[Git's gitignore syntax](https://git-scm.com/docs/gitignore), relative to the
+upstream repository root, rather than `vendor/<name>`:
+
+```json
+"exclude": ["/docs/", "**/tests/", "*.pdf", "!manual.pdf"]
+```
+
+A leading `/` anchors a pattern at the upstream root, a trailing `/` matches
+directories, and `**` matches across directory levels. Later `!` rules can
+keep matching files, subject to gitignore's rule that an excluded parent
+directory must be included again before its children can be included. Each
+list item is one gitignore line; JSON backslashes must be escaped as usual.
+Only the manifest rules apply, independent of upstream `.gitignore` files
+and your personal Git ignore settings.
+
+The script fetches the selected revision's complete history into a temporary
+repository and rewrites it with
+[`git-filter-repo`](https://github.com/newren/git-filter-repo), then imports
+the result with the usual squashed subtree operation. The upstream and
+consumer histories are not rewritten. Reusing the rules reproduces the same
+filtered ancestor commits, and excluded files are removed before merging,
+so later upstream changes to those files cannot cause merge conflicts.
+Local edits to retained files still participate in normal three-way merges
+and can conflict with overlapping upstream edits.
+
+Changing or removing `exclude` triggers an update even when `rev` stays the
+same. Adding rules to an existing dependency removes matching vendored
+files; removing rules restores upstream files. Local edits to files being
+removed can require conflict resolution.
+
+Successful imports remember their settings locally in
+`.git/vendor_imports.json`, tied to each dependency's import commit. This
+lets unchanged dependencies skip fetching and filtering even when the
+manifest is untracked. Without local settings, the script reads
+`vendor/vendor.json` at the import commit, or its first committed snapshot
+afterward if that snapshot still names the imported revision.
+
+With recorded settings, after a fresh clone or garbage collection, the
+script can rebuild a missing filtered split from that revision and its
+original rules, including before a downgrade or a rule change. Keep
+revisions pinned to unchanged tags or commit hashes that remain fetchable.
 
 ## Replacing a dependency with a local checkout
 
@@ -127,10 +175,14 @@ it, `git add -f` it once and the exclude entry becomes a no-op.
 
 For each entry in the manifest:
 
-1. The last commit touching `vendor/<name>` is inspected. If its message
-   mentions `rev`, the dependency is considered up to date and skipped.
-2. Otherwise `git subtree add --squash` is run for a new dependency, or
-   `git subtree pull --squash` for an existing one.
+1. The revision and exclusion list from the manifest at the latest import
+   are checked. If both match the current manifest, the dependency is skipped.
+   Unrecognized imports use the revision check on the last commit touching
+   the subtree.
+2. Otherwise upstream history is filtered if exclusions are configured, then
+   `git subtree add --squash` is run for a new dependency, or
+   `git subtree pull --squash` for an existing one. A fully excluded subtree
+   has no directory; adding content again starts a new squash import.
 3. The resulting commit is amended to the message
    `vendor: Upgraded <name> to '<rev>'`, which is what step 1 matches against
    on the next run.
@@ -144,7 +196,8 @@ fetch step.
 - Adding or updating a subtree requires a clean index and working tree because
   `git subtree` creates a commit for the imported snapshot. Commit or stash
   tracked changes first. Untracked files do not block an update.
-- The up-to-date check is a substring match on the last commit message, so
+- For imports without a recognized import message, the up-to-date check is a
+  substring match on the last commit message, so
   short revisions that are prefixes of one another can collide. Prefer full
   commit hashes or unambiguous tags.
 - Pinning to a branch name works, but the check will consider the subtree up
