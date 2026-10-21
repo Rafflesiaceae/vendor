@@ -9,5 +9,10 @@
     "repo_url": "git@github.com:example/libbar.git",
     "name": "libbar",
     "rev": "9f1c2ab"
+  },
+  {
+    "name": "libbaz",
+    "http": "https://example.com/releases/libbaz-1.0.0.zip",
+    "strip_root": true
   }
 ]

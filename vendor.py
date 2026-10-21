@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# vendor v0.23 (2026-10-21) (0c1705d439d29cc3)
+# vendor v0.23 (2026-10-21) (255be66ac92076f5)
 #
 # Updates vendor dependencies via git subtrees or HTTP ZIP archives
 #
@@ -8,8 +8,8 @@
 # Requirements:
 #   Python standard library only; never require third-party Python packages.
 #   - python >= 3.11
-#   Git >= 2.13.0 with git subtree installed (uses rev-parse --absolute-git-dir).
-#   When using exclude: Git >= 2.22.0 and git-filter-repo >= 2.23.0 on PATH.
+#   - git >= 2.22.0
+#   - git-filter-repo >= 2.23.0
 import filecmp
 import json
 import os
