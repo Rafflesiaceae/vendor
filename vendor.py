@@ -5,7 +5,10 @@
 #
 # https://github.com/Rafflesiaceae/vendor
 #
-# REQUIRES: python git
+# Requirements:
+#   Python >= 3.9 (standard library only; uses str.removeprefix).
+#   Git >= 2.13.0 with git subtree installed (uses rev-parse --absolute-git-dir).
+#   When using exclude: Git >= 2.22.0 and git-filter-repo >= 2.23.0 on PATH.
 import json
 import os
 import re
