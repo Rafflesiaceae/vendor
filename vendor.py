@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# vendor v0.23 (2026-10-21) (255be66ac92076f5)
+# vendor v0.24 (2026-10-21) (b045390d30dcef76)
 #
 # Updates vendor dependencies via git subtrees or HTTP ZIP archives
 #
@@ -1049,7 +1049,13 @@ def vendor_manifest_path():
 def parse_vendor_manifest(contents, path):
     """Decode either format using only the Python standard library."""
     if path.endswith(".toml"):
-        config_data = tomllib.loads(contents).get("vendor", [])
+        tables = tomllib.loads(contents)
+        if any(not isinstance(entry, dict) for entry in tables.values()):
+            raise ValueError(
+                f"Vendor configuration '{path}' must contain named dependency tables."
+            )
+        # The table key always supplies the name, even if a name field exists.
+        config_data = [dict(entry, name=name) for name, entry in tables.items()]
     else:
         config_data = json.loads(contents)
     if not isinstance(config_data, list):
@@ -1086,7 +1092,7 @@ def committed_vendor_manifest(commit):
 
 
 def load_vendor_config(path=None) -> List[VendorConfig]:
-    """Load JSON entries or TOML [[vendor]] tables with the same fields."""
+    """Load JSON entries or TOML tables keyed by dependency name."""
     if path is None:
         path = vendor_manifest_path()
     with open(path, "r", encoding="utf-8") as manifest:

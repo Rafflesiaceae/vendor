@@ -1,17 +1,14 @@
-[[vendor]]
+[libfoo]
 repo_url = "https://github.com/example/libfoo.git"
-name = "libfoo"
 # for git dependencies: a tag, branch, or commit hash.
 rev = "v1.4.2"
 exclude = ["docs/", "tests/", "*.pdf"]
 
-[[vendor]]
+[libbar]
 repo_url = "git@github.com:example/libbar.git"
-name = "libbar"
 rev = "9f1c2ab"
 
-[[vendor]]
-name = "libbaz"
+[libbaz]
 http = "https://example.com/releases/libbaz-1.0.0.zip"
 # Default heuristic: unwrap a single top-level directory; otherwise keep the ZIP layout.
 # true forces unwrapping (errors on other layouts); false keeps the layout.

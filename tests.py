@@ -115,21 +115,32 @@ class ManifestConfigTests(unittest.TestCase):
     def test_toml_tables_preserve_fields_and_exclusions(self):
         """TOML comments and multiple entries map to existing configurations."""
         (self.root / "vendor.toml").write_text(
-            '# A local manifest\n[[vendor]]\nrepo_url = "url"\n'
-            'name = "first"\nrev = "v1"\nexclude = ["docs/", "!keep.tmp"]\n'
-            '\n[[vendor]]\nrepo_url = "other"\nname = "second"\nrev = "v2"\n'
+            '# A local manifest\n[first]\nrepo_url = "url"\n'
+            'rev = "v1"\nexclude = ["docs/", "!keep.tmp"]\n'
+            '\n[second]\nrepo_url = "other"\nrev = "v2"\n'
         )
         self.assertEqual(vendor_module.load_vendor_config(), [
             vendor_module.VendorConfig("url", "first", "v1", ["docs/", "!keep.tmp"]),
             vendor_module.VendorConfig("other", "second", "v2"),
         ])
 
+    def test_toml_table_name_overrides_name_field(self):
+        """An embedded name cannot redirect a dependency to another directory."""
+        (self.root / "vendor.toml").write_text(
+            '["lib.foo"]\nname = "other"\nrepo_url = "url"\nrev = "v1"\n'
+        )
+        self.assertEqual(vendor_module.load_vendor_config(), [
+            vendor_module.VendorConfig("url", "lib.foo", "v1"),
+        ])
+
     @unittest.skipUnless(sys.version_info >= (3, 11), "TOML requires stdlib tomllib")
     def test_invalid_toml_reports_an_error(self):
         """Reject malformed syntax, empty tables, missing fields and bad rules."""
         for contents in (
-            "[[vendor]", "", "vendor = 3", '[[vendor]]\nname = "missing"',
-            '[[vendor]]\nrepo_url = "url"\nname = "lib"\nrev = "v1"\nexclude = "docs/"',
+            "[lib", "", "vendor = 3", "[missing]",
+            '[lib]\nrepo_url = "url"\nrev = "v1"\nexclude = "docs/"',
+            '[[vendor]]\nrepo_url = "url"\nname = "lib"\nrev = "v1"',
+            '[""]\nrepo_url = "url"\nrev = "v1"',
         ):
             with self.subTest(contents=contents):
                 (self.root / "vendor.toml").write_text(contents)
@@ -166,7 +177,7 @@ class ManifestConfigTests(unittest.TestCase):
         )
         for filename, contents in (
             ("vendor.json", '[{"name":"lib","http":"https://example.invalid/lib.zip","strip_root":false}]'),
-            ("vendor.toml", '[[vendor]]\nname="lib"\nhttp="https://example.invalid/lib.zip"\nstrip_root=false'),
+            ("vendor.toml", '[lib]\nhttp="https://example.invalid/lib.zip"\nstrip_root=false'),
         ):
             with self.subTest(filename=filename):
                 path = self.root / filename
@@ -441,8 +452,9 @@ class VendorIntegrationTests(unittest.TestCase):
         path = self.consumer / "vendor/vendor.json"
         entries = json.loads(path.read_text())
         contents = "\n".join(
-            "[[vendor]]\n" + "\n".join(
-                f"{key} = {json.dumps(value)}" for key, value in entry.items()
+            f'[{json.dumps(entry["name"])}]\n' + "\n".join(
+                f"{key} = {json.dumps(value)}"
+                for key, value in entry.items() if key != "name"
             ) + "\n"
             for entry in entries
         )

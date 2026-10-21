@@ -68,18 +68,17 @@ requires `repo_url`, `name`, and `rev`:
 ]
 ```
 
-Alternatively, create `vendor/vendor.toml` using `[[vendor]]` tables:
+Alternatively, create `vendor/vendor.toml` using the dependency names as table
+headers:
 
 ```toml
-[[vendor]]
+[libfoo]
 repo_url = "https://github.com/example/libfoo.git"
-name = "libfoo"
 rev = "v1.4.2"
 exclude = ["docs/", "tests/", "*.pdf"]
 
-[[vendor]]
+[libbar]
 repo_url = "git@github.com:example/libbar.git"
-name = "libbar"
 rev = "9f1c2ab"
 ```
 
@@ -87,13 +86,15 @@ Choose exactly one manifest format. If both `vendor/vendor.json` and
 `vendor/vendor.toml` exist, the script exits with an error before applying
 replacements or updating dependencies. TOML uses Python's standard library
 `tomllib` module and requires Python >= 3.11; no Python packages are needed.
-Both formats use the same fields and support exclusions. Historical import
-settings are read from either format, including after switching formats.
+In TOML, the table header always supplies the dependency name; no `name` field
+is needed. The other fields and exclusions work the same in both formats.
+Historical import settings are read from either format, including after
+switching formats.
 
 | Field      | Description                                                       |
 | ---------- | ----------------------------------------------------------------- |
 | `repo_url` | Any URL `git` can clone from.                                     |
-| `name`     | Directory name of the subtree, created at `vendor/<name>`.        |
+| `name`     | Directory name, created at `vendor/<name>`. JSON field or TOML table header. |
 | `rev`      | Required for Git sources: a tag, branch, or commit-ish `git` understands. |
 | `http`     | HTTP or HTTPS URL to a ZIP archive, used instead of `repo_url`. |
 | `strip_root` | Optional ZIP-only boolean overriding the archive layout heuristic. |
@@ -101,7 +102,7 @@ settings are read from either format, including after switching formats.
 
 ### ZIP dependencies
 
-For ZIP archives, `name` and `http` are mandatory. Set exactly one of
+For ZIP archives, a name (JSON field or TOML table header) and `http` are mandatory. Set exactly one of
 `repo_url` or `http` for each dependency; ZIP entries do not need `rev`:
 
 ```json
@@ -116,8 +117,7 @@ For ZIP archives, `name` and `http` are mandatory. Set exactly one of
 The equivalent TOML entry is:
 
 ```toml
-[[vendor]]
-name = "libfoo"
+[libfoo]
 http = "https://example.com/releases/libfoo-1.4.2.zip"
 ```
 
