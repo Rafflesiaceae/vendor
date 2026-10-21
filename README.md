@@ -1,9 +1,8 @@
 # vendor
 
-Updates vendor dependencies via git subtrees.
+Updates vendor dependencies via git subtrees or HTTP ZIP archives.
 
-`vendor.py` reads a `vendor/vendor.json` or `vendor/vendor.toml` manifest and adds or updates a git
-subtree under `vendor/<name>` for every entry, so third-party sources are
+`vendor.py` reads a `vendor/vendor.json` or `vendor/vendor.toml` manifest and imports each dependency under `vendor/<name>`, using Git subtrees or ZIP snapshots. Third-party sources are
 checked into your repository at a pinned revision instead of being fetched at
 build time.
 
@@ -11,7 +10,7 @@ build time.
 
 - Python >= 3.11 (standard library only; no third-party Python packages)
 - `git` (with `git subtree` available)
-- `git-filter-repo` on `PATH` when any dependency uses `exclude`
+- `git-filter-repo` on `PATH` when any Git dependency uses `exclude`
 
 ## Usage
 
@@ -50,8 +49,8 @@ and records the current date and checksum; otherwise it leaves the file alone.
 
 ## Configuration
 
-Create `vendor/vendor.json` containing a list of dependencies. Every entry
-requires all three fields:
+Create `vendor/vendor.json` containing a list of dependencies. Every Git entry
+requires `repo_url`, `name`, and `rev`:
 
 ```json
 [
@@ -95,8 +94,52 @@ settings are read from either format, including after switching formats.
 | ---------- | ----------------------------------------------------------------- |
 | `repo_url` | Any URL `git` can clone from.                                     |
 | `name`     | Directory name of the subtree, created at `vendor/<name>`.        |
-| `rev`      | Revision to pull — a tag, branch, or commit-ish `git` understands. |
+| `rev`      | Required for Git sources: a tag, branch, or commit-ish `git` understands. |
+| `http`     | HTTP or HTTPS URL to a ZIP archive, used instead of `repo_url`. |
+| `strip_root` | Optional ZIP-only boolean overriding the archive layout heuristic. |
 | `exclude`  | Optional list of gitignore patterns to remove before importing. Defaults to `[]`. |
+
+### ZIP dependencies
+
+For ZIP archives, `name` and `http` are mandatory. Set exactly one of
+`repo_url` or `http` for each dependency; ZIP entries do not need `rev`:
+
+```json
+[
+  {
+    "name": "libfoo",
+    "http": "https://example.com/releases/libfoo-1.4.2.zip"
+  }
+]
+```
+
+The equivalent TOML entry is:
+
+```toml
+[[vendor]]
+name = "libfoo"
+http = "https://example.com/releases/libfoo-1.4.2.zip"
+```
+
+By default, an archive containing only one top-level directory has that
+directory unwrapped into `vendor/<name>`. If it contains multiple top-level
+entries or a single file, all entries are enclosed in `vendor/<name>`.
+For example, `release/src/lib.c` becomes `vendor/libfoo/src/lib.c` when
+`release/` is the only top-level entry. An archive containing `src/`,
+`include/`, and `README` keeps all three inside `vendor/libfoo/`.
+
+Set `strip_root = false` in TOML or `"strip_root": false` in JSON to always
+keep the archive layout. Set it to `true` to require and unwrap exactly one
+top-level directory; any other layout causes an error. Omit it to use the
+heuristic. Exclusion rules apply relative to the selected import root.
+
+Each run downloads the archive and compares its contents and executable
+permissions with the existing import. Changed files and deletions are
+committed; identical snapshots create no commit. ZIP imports require a
+clean tracked working tree and refuse to replace destinations containing
+untracked or ignored local files. Local replacements work for ZIP sources
+as well. Archive handling uses only Python's standard library, with no
+`unzip` command or Python packages required.
 
 ### Excluding upstream paths
 

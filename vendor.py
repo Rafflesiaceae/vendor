@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-# vendor v0.19 (2026-10-21) (1f82c3b05c71ef84)
+# vendor v0.23 (2026-10-21) (0c1705d439d29cc3)
 #
-# Updates vendor dependencies via git subtrees
+# Updates vendor dependencies via git subtrees or HTTP ZIP archives
 #
 # https://github.com/Rafflesiaceae/vendor
 #
@@ -10,6 +10,7 @@
 #   - python >= 3.11
 #   Git >= 2.13.0 with git subtree installed (uses rev-parse --absolute-git-dir).
 #   When using exclude: Git >= 2.22.0 and git-filter-repo >= 2.23.0 on PATH.
+import filecmp
 import json
 import os
 import re
@@ -20,6 +21,8 @@ import sys
 import tempfile
 import tomllib
 import urllib.request
+import urllib.parse
+import zipfile
 
 from contextlib import contextmanager
 from dataclasses import dataclass, asdict, field
@@ -46,12 +49,36 @@ EXCLUDE_END = "# END vendor.py replace"
 
 @dataclass
 class VendorConfig:
-    repo_url: str
-    name: str
-    rev: str
+    repo_url: str = None
+    name: str = None
+    rev: str = None
     exclude: List[str] = field(default_factory=list)
+    http: str = None
+    strip_root: bool = None
 
     def __post_init__(self):
+        # Both source types share a mandatory destination and exclusion rules.
+        if not isinstance(self.name, str) or not self.name:
+            raise ValueError("Each vendor config requires a non-empty 'name'")
+        if (self.repo_url is None) == (self.http is None):
+            raise ValueError("Each vendor config requires exactly one of 'repo_url' or 'http'")
+        if self.http is not None:
+            if not isinstance(self.http, str) or urllib.parse.urlsplit(self.http).scheme not in ("http", "https"):
+                raise ValueError("'http' must be an HTTP or HTTPS ZIP URL")
+            if self.strip_root is not None and not isinstance(self.strip_root, bool):
+                raise ValueError("'strip_root' must be a boolean")
+            # Archive imports replace their destination, so never allow them
+            # to address parent directories or the consumer's manifest files.
+            if (
+                any(character in self.name for character in "\\:*?[]")
+                or any(part in ("", ".", "..", ".git") for part in self.name.split("/"))
+                or self.name in ("vendor.json", "vendor.toml", "vendor_replace.json")
+            ):
+                raise ValueError("ZIP 'name' must be a relative directory below vendor/")
+        elif not self.rev:
+            raise ValueError("Git vendor configs require 'repo_url', 'name', and 'rev'")
+        elif self.strip_root is not None:
+            raise ValueError("'strip_root' is only supported for HTTP ZIP dependencies")
         # Each item represents exactly one gitignore rule, including escapes
         # and negation; reject separators that would inject additional rules.
         if not isinstance(self.exclude, list) or any(
@@ -507,7 +534,8 @@ def last_vendor_import(name):
         # A newer revision cannot describe settings used by an earlier import.
         manifest = [
             entry for entry in manifest
-            if subject == f"vendor: Upgraded {name} to '{entry['rev']}'"
+            if entry.get("repo_url")
+            and subject == f"vendor: Upgraded {name} to '{entry['rev']}'"
         ]
     for entry in manifest:
         if entry["name"] == name:
@@ -725,7 +753,7 @@ def is_subtree_up_to_date(target_path, rev, exclude=None):
         return False
 
 
-def require_clean_worktree_for_subtree(target_path):
+def require_clean_worktree_for_subtree(target_path, operation="git subtree"):
     """Exit cleanly when tracked changes would make git subtree refuse."""
     # Match git subtree's cleanliness checks: tracked index and worktree
     # changes matter, while unrelated untracked files are safe to leave alone.
@@ -739,7 +767,7 @@ def require_clean_worktree_for_subtree(target_path):
         return
 
     print(
-        f"Cannot update subtree at '{target_path}': git subtree requires "
+        f"Cannot update dependency at '{target_path}': {operation} requires "
         "a clean index and working tree.",
         file=sys.stderr,
     )
@@ -856,6 +884,150 @@ def manage_subtree(repo_url, name, rev, exclude=None):
     print(f"Subtree at '{target_path}' is now at revision '{rev}'.\n")
 
 
+def extract_zip(archive_path, destination, strip_root=None):
+    """Validate an archive before extracting and select its import root."""
+    with zipfile.ZipFile(archive_path) as archive:
+        members = archive.infolist()
+        for member in members:
+            # Reject traversal, repository metadata, and symlinks rather than
+            # allowing archive contents to escape or control the destination.
+            parts = member.filename.rstrip("/").split("/")
+            mode = member.external_attr >> 16
+            if (
+                "\\" in member.filename or ":" in parts[0]
+                or any(part in ("", ".", "..", ".git") for part in parts)
+                or stat.S_ISLNK(mode)
+            ):
+                raise ValueError(f"Unsafe ZIP entry: {member.filename!r}")
+        archive.extractall(destination)
+        for member in members:
+            # zipfile does not restore executable bits; retain those needed
+            # by vendored scripts while excluding special permission bits.
+            if not member.is_dir():
+                mode = 0o755 if (member.external_attr >> 16) & 0o111 else 0o644
+                os.chmod(os.path.join(destination, member.filename), mode)
+
+    entries = os.listdir(destination)
+    single_directory = (
+        len(entries) == 1 and os.path.isdir(os.path.join(destination, entries[0]))
+    )
+    if strip_root is True and not single_directory:
+        raise ValueError("strip_root=true requires exactly one top-level directory")
+    if single_directory and strip_root is not False:
+        return os.path.join(destination, entries[0])
+    return destination
+
+
+def exclude_zip_paths(source, patterns, temporary):
+    """Apply the same Git ignore rules as subtree imports to ZIP contents."""
+    if not patterns:
+        return
+    matcher = os.path.join(temporary, "matcher")
+    subprocess.check_call(["git", "init", "--quiet", matcher])
+    with open(os.path.join(matcher, ".git", "info", "exclude"), "w") as rules:
+        rules.write("\n".join(patterns) + "\n")
+    paths = [
+        os.path.relpath(os.path.join(directory, filename), source)
+        for directory, _, filenames in os.walk(source) for filename in filenames
+    ]
+    result = subprocess.run(
+        ["git", "-C", matcher, "-c", f"core.excludesFile={os.devnull}",
+         "-c", "core.ignoreCase=false", "check-ignore", "--no-index", "--stdin", "-z"],
+        input=b"\0".join(os.fsencode(path) for path in paths) + (b"\0" if paths else b""),
+        stdout=subprocess.PIPE,
+    )
+    if result.returncode not in (0, 1):
+        result.check_returncode()
+    for path in result.stdout.split(b"\0"):
+        if path:
+            os.unlink(os.path.join(source, os.fsdecode(path)))
+
+
+def zip_contents_match(source, target):
+    """Compare files and executable bits; Git does not track empty directories."""
+    def files_below(root):
+        return {
+            os.path.relpath(os.path.join(directory, filename), root)
+            for directory, _, filenames in os.walk(root) for filename in filenames
+        }
+
+    paths = files_below(source)
+    if paths != files_below(target):
+        return False
+    for path in paths:
+        source_file = os.path.join(source, path)
+        target_file = os.path.join(target, path)
+        if (
+            os.path.islink(target_file)
+            or (
+                bool(os.stat(source_file).st_mode & 0o111)
+                != bool(os.stat(target_file).st_mode & 0o111)
+            )
+            or not filecmp.cmp(source_file, target_file, shallow=False)
+        ):
+            return False
+    return True
+
+
+def manage_zip(config):
+    """Download a ZIP snapshot and commit only changes below its destination."""
+    target = os.path.join("vendor", config.name)
+    require_clean_worktree_for_subtree(target, operation="ZIP import")
+    # Replacing a directory must not discard local ignored or untracked files,
+    # or write through a symlink left outside the replacement mechanism.
+    current = target
+    while current:
+        if os.path.islink(current):
+            raise ValueError(f"ZIP destination contains a symlink: {current}")
+        current = os.path.dirname(current)
+    if os.path.exists(target) and not os.path.isdir(target):
+        raise ValueError(f"ZIP destination is not a directory: {target}")
+    local_files = run_cmd([
+        "git", "status", "--porcelain", "--untracked-files=all", "--ignored", "--", target,
+    ])
+    if local_files:
+        raise ValueError(f"ZIP destination contains local changes or untracked/ignored files: {target}")
+
+    with tempfile.TemporaryDirectory(prefix="vendor-zip-") as temporary:
+        archive_path = os.path.join(temporary, "download.zip")
+        # Download and validate everything before touching an existing import.
+        with urllib.request.urlopen(config.http, timeout=30) as response:
+            with open(archive_path, "wb") as archive:
+                shutil.copyfileobj(response, archive)
+        extracted = os.path.join(temporary, "extracted")
+        os.mkdir(extracted)
+        source = extract_zip(archive_path, extracted, config.strip_root)
+        exclude_zip_paths(source, config.exclude, temporary)
+        if zip_contents_match(source, target):
+            print(f"ZIP dependency '{config.name}' is unchanged, skipping update.")
+            return
+
+        backup = os.path.join(temporary, "previous")
+        if os.path.exists(target):
+            shutil.move(target, backup)
+        try:
+            shutil.copytree(source, target)
+        except OSError:
+            # Retain the old checkout if writing the new snapshot fails.
+            if os.path.exists(target):
+                shutil.rmtree(target)
+            if os.path.exists(backup):
+                shutil.move(backup, target)
+            raise
+        # Imported files belong to the snapshot even if an upstream or local
+        # .gitignore would hide them; only explicit exclude rules remove them.
+        subprocess.check_call(["git", "add", "--force", "--all", "--", target])
+        changed = subprocess.run(["git", "diff", "--cached", "--quiet", "--", target])
+        if changed.returncode == 1:
+            subprocess.check_call([
+                "git", "commit", "--edit", "-m",
+                f"vendor: Updated {config.name} from '{config.http}'",
+            ])
+        elif changed.returncode != 0:
+            changed.check_returncode()
+    print(f"ZIP dependency '{config.name}' updated at '{target}'.")
+
+
 def vendor_manifest_path():
     """Select exactly one supported manifest before modifying the worktree."""
     paths = [
@@ -885,11 +1057,9 @@ def parse_vendor_manifest(contents, path):
     if not config_data:
         raise ValueError(f"Vendor configuration file '{path}' is empty.")
     for entry in config_data:
-        if not isinstance(entry, dict) or not all(
-            key in entry for key in ("repo_url", "name", "rev")
-        ):
+        if not isinstance(entry, dict) or "name" not in entry:
             raise ValueError(
-                "Each vendor config must include 'repo_url', 'name', and 'rev'"
+                "Each vendor config must include 'name' and a Git or HTTP source"
             )
     return config_data
 
@@ -994,7 +1164,14 @@ def main(argv=None):
                 f"'{replacements[vendor.name]}'.\n"
             )
             continue
-        manage_subtree(vendor.repo_url, vendor.name, vendor.rev, vendor.exclude)
+        if vendor.http is not None:
+            try:
+                manage_zip(vendor)
+            except (OSError, ValueError, zipfile.BadZipFile, subprocess.CalledProcessError) as error:
+                print(f"Cannot update ZIP dependency '{vendor.name}': {error}", file=sys.stderr)
+                return 1
+        else:
+            manage_subtree(vendor.repo_url, vendor.name, vendor.rev, vendor.exclude)
     return 0
 
 

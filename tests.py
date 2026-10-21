@@ -9,9 +9,10 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
 
 from contextlib import redirect_stdout
-from io import StringIO
+from io import BytesIO, StringIO
 from pathlib import Path
 from unittest import mock
 
@@ -143,6 +144,93 @@ class ManifestConfigTests(unittest.TestCase):
         self.assertEqual(vendor_module.load_vendor_config(), [
             vendor_module.VendorConfig("url", "lib", "v1"),
         ])
+
+    def test_http_configuration_requires_a_name_and_one_source(self):
+        """ZIP destinations and layout overrides must be explicit and safe."""
+        for entry in (
+            {"http": "https://example.invalid/lib.zip"},
+            {"name": "lib"},
+            {"name": "lib", "http": "file:///lib.zip"},
+            {"name": "lib", "http": "https://example.invalid/lib.zip", "repo_url": "url"},
+            {"name": "../outside", "http": "https://example.invalid/lib.zip"},
+            {"name": "vendor.json", "http": "https://example.invalid/lib.zip"},
+            {"name": "lib", "http": "https://example.invalid/lib.zip", "strip_root": "auto"},
+        ):
+            with self.subTest(entry=entry), self.assertRaises(ValueError):
+                vendor_module.VendorConfig(**entry)
+
+    def test_http_entries_load_from_both_formats(self):
+        """ZIP entries need no Git URL or revision in either manifest format."""
+        expected = vendor_module.VendorConfig(
+            name="lib", http="https://example.invalid/lib.zip", strip_root=False,
+        )
+        for filename, contents in (
+            ("vendor.json", '[{"name":"lib","http":"https://example.invalid/lib.zip","strip_root":false}]'),
+            ("vendor.toml", '[[vendor]]\nname="lib"\nhttp="https://example.invalid/lib.zip"\nstrip_root=false'),
+        ):
+            with self.subTest(filename=filename):
+                path = self.root / filename
+                path.write_text(contents)
+                self.assertEqual(vendor_module.load_vendor_config(str(path)), [expected])
+
+
+class ZipExtractionTests(unittest.TestCase):
+    """Archive layout choices must not permit writes outside the import."""
+
+    def test_layout_heuristic_and_overrides(self):
+        """Unwrap a lone directory, enclosing mixed or multiple root entries."""
+        for paths, strip_root, expected in (
+            (["release/lib.c"], None, ["lib.c"]),
+            (["release/lib.c"], False, ["release/lib.c"]),
+            (["release/lib.c"], True, ["lib.c"]),
+            (["src/lib.c", "include/lib.h"], None, ["src/lib.c", "include/lib.h"]),
+            (["src/lib.c", "README"], None, ["src/lib.c", "README"]),
+            (["lib.c"], None, ["lib.c"]),
+        ):
+            with self.subTest(paths=paths, strip_root=strip_root):
+                with tempfile.TemporaryDirectory(prefix="vendor-extract-") as temporary:
+                    root = Path(temporary)
+                    archive_path = root / "source.zip"
+                    with zipfile.ZipFile(archive_path, "w") as archive:
+                        for path in paths:
+                            archive.writestr(path, "source\n")
+                    destination = root / "extracted"
+                    destination.mkdir()
+                    source = Path(vendor_module.extract_zip(archive_path, destination, strip_root))
+                    self.assertEqual(
+                        {str(path.relative_to(source)) for path in source.rglob("*") if path.is_file()},
+                        set(expected),
+                    )
+
+    def test_forced_stripping_rejects_multiple_roots(self):
+        """An explicit strip request cannot guess which directory to retain."""
+        with tempfile.TemporaryDirectory(prefix="vendor-extract-") as temporary:
+            root = Path(temporary)
+            with zipfile.ZipFile(root / "source.zip", "w") as archive:
+                archive.writestr("first/lib.c", "source")
+                archive.writestr("second/lib.c", "source")
+            (root / "extracted").mkdir()
+            with self.assertRaisesRegex(ValueError, "exactly one top-level directory"):
+                vendor_module.extract_zip(root / "source.zip", root / "extracted", True)
+
+    def test_unsafe_paths_and_symlinks_are_rejected_before_extraction(self):
+        """No archive entry may escape or create repository metadata."""
+        for name, mode in (
+            ("../escaped", 0), ("/absolute", 0), ("dir/../../escaped", 0),
+            ("dir\\escaped", 0), (".git/config", 0), ("root/.git/config", 0),
+            ("link", stat.S_IFLNK | 0o777),
+        ):
+            with self.subTest(name=name), tempfile.TemporaryDirectory(prefix="vendor-extract-") as temporary:
+                root = Path(temporary)
+                with zipfile.ZipFile(root / "source.zip", "w") as archive:
+                    archive.writestr("safe.c", "source")
+                    member = zipfile.ZipInfo(name)
+                    member.external_attr = mode << 16
+                    archive.writestr(member, "outside")
+                (root / "extracted").mkdir()
+                with self.assertRaisesRegex(ValueError, "Unsafe ZIP entry"):
+                    vendor_module.extract_zip(root / "source.zip", root / "extracted")
+                self.assertEqual(list((root / "extracted").iterdir()), [])
 
 
 class SelfUpdateTests(unittest.TestCase):
@@ -692,6 +780,112 @@ class VendorIntegrationTests(unittest.TestCase):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
+
+    def _run_with_zip_download(self, contents):
+        """Exercise real Git imports while replacing only the network response."""
+        previous_directory = os.getcwd()
+        output = StringIO()
+        try:
+            os.chdir(self.consumer)
+            with mock.patch.dict(os.environ, COMMAND_ENV):
+                with mock.patch.object(vendor_module.urllib.request, "urlopen", return_value=BytesIO(contents)) as download:
+                    with redirect_stdout(output):
+                        result = vendor_module.main([])
+                    if download.called:
+                        download.assert_called_once_with("https://example.invalid/lib.zip", timeout=30)
+            return result, output.getvalue()
+        finally:
+            os.chdir(previous_directory)
+
+    def _zip_bytes(self, files):
+        """Build a downloadable archive with an executable shell fixture."""
+        stream = BytesIO()
+        with zipfile.ZipFile(stream, "w") as archive:
+            for name, contents in files.items():
+                member = zipfile.ZipInfo(name)
+                member.external_attr = (stat.S_IFREG | (0o755 if name.endswith(".sh") else 0o644)) << 16
+                archive.writestr(member, contents)
+        return stream.getvalue()
+
+    def test_zip_import_updates_deletes_and_is_idempotent(self):
+        """ZIP snapshots use their mandatory name and commit only real changes."""
+        manifest = self.consumer / "vendor/vendor.json"
+        manifest.write_text(json.dumps([{
+            "name": "archive", "http": "https://example.invalid/lib.zip", "exclude": ["docs/"],
+        }]))
+        commit_all(self.consumer, "Configure ZIP dependency")
+        contents = self._zip_bytes({
+            "release/lib.c": "version one", "release/obsolete.c": "old",
+            "release/run.sh": "#!/bin/sh\nexit 0\n", "release/docs/guide": "excluded",
+            "release/.gitignore": "*.c\n",
+        })
+        self.assertEqual(self._run_with_zip_download(contents)[0], 0)
+        target = self.consumer / "vendor/archive"
+        self.assertEqual((target / "lib.c").read_text(), "version one")
+        self.assertFalse((target / "docs/guide").exists())
+        self.assertTrue((target / "run.sh").stat().st_mode & 0o111)
+        self.assertIn("vendor/archive/lib.c", git(self.consumer, "ls-files"))
+        head = git(self.consumer, "rev-parse", "HEAD")
+        result, output = self._run_with_zip_download(contents)
+        self.assertEqual(result, 0)
+        self.assertIn("unchanged", output)
+        self.assertEqual(git(self.consumer, "rev-parse", "HEAD"), head)
+
+        # A subsequent archive replaces deleted paths rather than accumulating
+        # files from older releases in the vendored snapshot.
+        contents = self._zip_bytes({"release/lib.c": "version two"})
+        self.assertEqual(self._run_with_zip_download(contents)[0], 0)
+        self.assertEqual((target / "lib.c").read_text(), "version two")
+        self.assertFalse((target / "obsolete.c").exists())
+        self.assertEqual(git(self.consumer, "status", "--porcelain"), "")
+
+    def test_toml_can_mix_git_and_zip_sources_with_layout_override(self):
+        """Mixed manifests route each source independently and honor strip_root."""
+        manifest = self.consumer / "vendor/vendor.json"
+        entries = json.loads(manifest.read_text())
+        entries.append({"name": "archive", "http": "https://example.invalid/lib.zip", "strip_root": False})
+        manifest.write_text(json.dumps(entries))
+        self._convert_manifest_to_toml()
+        commit_all(self.consumer, "Configure mixed TOML dependencies")
+        contents = self._zip_bytes({"release/lib.c": "source"})
+        self.assertEqual(self._run_with_zip_download(contents)[0], 0)
+        self._assert_release("v1.0.0")
+        self.assertEqual((self.consumer / "vendor/archive/release/lib.c").read_text(), "source")
+        self.assertEqual(git(self.consumer, "status", "--porcelain"), "")
+
+    def test_zip_encloses_multiple_root_entries(self):
+        """Multiple directories and root files all live under the configured name."""
+        (self.consumer / "vendor/vendor.json").write_text(json.dumps([
+            {"name": "archive", "http": "https://example.invalid/lib.zip"},
+        ]))
+        commit_all(self.consumer, "Configure multi-root archive")
+        contents = self._zip_bytes({"src/lib.c": "source", "include/lib.h": "header", "README": "readme"})
+        self.assertEqual(self._run_with_zip_download(contents)[0], 0)
+        target = self.consumer / "vendor/archive"
+        for path in ("src/lib.c", "include/lib.h", "README"):
+            self.assertTrue((target / path).is_file())
+        self.assertFalse((self.consumer / "src").exists())
+
+    def test_invalid_zip_keeps_the_existing_import(self):
+        """A failed download or unsafe archive cannot remove a working snapshot."""
+        (self.consumer / "vendor/vendor.json").write_text(json.dumps([
+            {"name": "archive", "http": "https://example.invalid/lib.zip"},
+        ]))
+        commit_all(self.consumer, "Configure archive")
+        self.assertEqual(self._run_with_zip_download(self._zip_bytes({"lib.c": "source"}))[0], 0)
+        head = git(self.consumer, "rev-parse", "HEAD")
+        for contents in (b"not a zip", self._zip_bytes({"../escape": "bad"})):
+            with self.subTest(contents=contents):
+                self.assertEqual(self._run_with_zip_download(contents)[0], 1)
+                self.assertEqual((self.consumer / "vendor/archive/lib.c").read_text(), "source")
+                self.assertEqual(git(self.consumer, "rev-parse", "HEAD"), head)
+                self.assertEqual(git(self.consumer, "status", "--porcelain"), "")
+
+        # Untracked work inside the destination must survive attempted updates.
+        local = self.consumer / "vendor/archive/local.txt"
+        local.write_text("keep me")
+        self.assertEqual(self._run_with_zip_download(self._zip_bytes({"lib.c": "new"}))[0], 1)
+        self.assertEqual(local.read_text(), "keep me")
 
     def _assert_release(self, revision):
         """Check that both vendored source files match a tagged release."""
