@@ -78,6 +78,73 @@ class ExcludeConfigTests(unittest.TestCase):
                     self.fail("filtering must not proceed without git-filter-repo")
 
 
+class ManifestConfigTests(unittest.TestCase):
+    """Both manifest formats share validation and need no Python packages."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="vendor-manifest-")
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        for attribute, filename in (
+            ("VENDOR_JSON_PATH", "vendor.json"),
+            ("VENDOR_TOML_PATH", "vendor.toml"),
+        ):
+            patcher = mock.patch.object(vendor_module, attribute, str(self.root / filename))
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_both_formats_fail_before_replacements(self):
+        """Conflicting manifests must never change a consumer's worktree."""
+        (self.root / "vendor.json").write_text("[]")
+        (self.root / "vendor.toml").write_text("")
+        output = StringIO()
+        with mock.patch.object(vendor_module, "apply_replacements") as replace:
+            with redirect_stdout(output):
+                self.assertEqual(vendor_module.main([]), 1)
+        self.assertIn("Both", output.getvalue())
+        self.assertIn("Choose one format", output.getvalue())
+        replace.assert_not_called()
+
+    def test_missing_manifest_names_both_choices(self):
+        """A missing config explains both supported filenames."""
+        with self.assertRaisesRegex(FileNotFoundError, "vendor.json.*vendor.toml"):
+            vendor_module.load_vendor_config()
+
+    @unittest.skipUnless(sys.version_info >= (3, 11), "TOML requires stdlib tomllib")
+    def test_toml_tables_preserve_fields_and_exclusions(self):
+        """TOML comments and multiple entries map to existing configurations."""
+        (self.root / "vendor.toml").write_text(
+            '# A local manifest\n[[vendor]]\nrepo_url = "url"\n'
+            'name = "first"\nrev = "v1"\nexclude = ["docs/", "!keep.tmp"]\n'
+            '\n[[vendor]]\nrepo_url = "other"\nname = "second"\nrev = "v2"\n'
+        )
+        self.assertEqual(vendor_module.load_vendor_config(), [
+            vendor_module.VendorConfig("url", "first", "v1", ["docs/", "!keep.tmp"]),
+            vendor_module.VendorConfig("other", "second", "v2"),
+        ])
+
+    @unittest.skipUnless(sys.version_info >= (3, 11), "TOML requires stdlib tomllib")
+    def test_invalid_toml_reports_an_error(self):
+        """Reject malformed syntax, empty tables, missing fields and bad rules."""
+        for contents in (
+            "[[vendor]", "", "vendor = 3", '[[vendor]]\nname = "missing"',
+            '[[vendor]]\nrepo_url = "url"\nname = "lib"\nrev = "v1"\nexclude = "docs/"',
+        ):
+            with self.subTest(contents=contents):
+                (self.root / "vendor.toml").write_text(contents)
+                with self.assertRaises(ValueError):
+                    vendor_module.load_vendor_config()
+
+    def test_json_fields_are_unchanged(self):
+        """The existing JSON manifest schema remains supported."""
+        (self.root / "vendor.json").write_text(
+            '[{"repo_url": "url", "name": "lib", "rev": "v1"}]'
+        )
+        self.assertEqual(vendor_module.load_vendor_config(), [
+            vendor_module.VendorConfig("url", "lib", "v1"),
+        ])
+
+
 class SelfUpdateTests(unittest.TestCase):
     """Exercise self-updates without accessing the network."""
 
@@ -280,6 +347,19 @@ class VendorIntegrationTests(unittest.TestCase):
         manifest[0]["exclude"] = patterns
         manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
         commit_all(self.consumer, f"Configure {revision} exclusions")
+
+    def _convert_manifest_to_toml(self):
+        """Express fixture strings and arrays as TOML without a writer package."""
+        path = self.consumer / "vendor/vendor.json"
+        entries = json.loads(path.read_text())
+        contents = "\n".join(
+            "[[vendor]]\n" + "\n".join(
+                f"{key} = {json.dumps(value)}" for key, value in entry.items()
+            ) + "\n"
+            for entry in entries
+        )
+        path.with_suffix(".toml").write_text(contents)
+        path.unlink()
 
     def _prepare_exclusion_source(self):
         """Create releases with kept files, ignored files, and excluded-only edits."""
@@ -647,6 +727,55 @@ class VendorIntegrationTests(unittest.TestCase):
             head_after_first_run, git(self.consumer, "rev-parse", "HEAD")
         )
         self.assertEqual(output.count("already at revision 'v1.0.0'"), 2)
+        self.assertEqual(git(self.consumer, "status", "--porcelain"), "")
+
+    @unittest.skipUnless(sys.version_info >= (3, 11), "TOML requires stdlib tomllib")
+    def test_toml_import_upgrade_downgrade_and_clone(self):
+        """TOML imports retain their pins after cloning and support updates."""
+        for revision in ("v1.0.0", "v2.0.0", "v1.0.0"):
+            self._write_manifest(revision)
+            self._convert_manifest_to_toml()
+            commit_all(self.consumer, f"Configure TOML {revision}")
+            self.assertIn("vendor/vendor.toml", self._run_vendor())
+            self._assert_release(revision)
+        self._clone_consumer()
+        head = git(self.consumer, "rev-parse", "HEAD")
+        # Missing upstreams prove historical TOML settings skip all fetching.
+        for repository in self.sources.values():
+            shutil.rmtree(repository)
+        self.assertEqual(self._run_vendor().count("already at revision"), 2)
+        self.assertEqual(git(self.consumer, "rev-parse", "HEAD"), head)
+
+    @unittest.skipUnless(sys.version_info >= (3, 11), "TOML requires stdlib tomllib")
+    def test_format_switch_preserves_historical_import_settings(self):
+        """A clone must find old imports even when today's format differs."""
+        self._run_vendor()
+        self._convert_manifest_to_toml()
+        commit_all(self.consumer, "Switch manifest to TOML")
+        self._clone_consumer()
+        for repository in self.sources.values():
+            shutil.rmtree(repository)
+        self.assertEqual(self._run_vendor().count("already at revision"), 2)
+        self.assertEqual(git(self.consumer, "status", "--porcelain"), "")
+
+    @unittest.skipUnless(
+        sys.version_info >= (3, 11) and shutil.which("git-filter-repo"),
+        "requires stdlib tomllib and git-filter-repo",
+    )
+    def test_toml_exclusions_after_clone_and_format_switch(self):
+        """Rebuild filtered ancestors from TOML when switching back to JSON."""
+        self._prepare_exclusion_source()
+        self._write_exclusion_manifest("filtered-v1", ["docs/"])
+        self._convert_manifest_to_toml()
+        commit_all(self.consumer, "Use TOML exclusions")
+        self._run_vendor()
+        self._clone_consumer()
+        (self.consumer / "vendor/vendor.toml").unlink()
+        self._write_exclusion_manifest("filtered-v1", ["*.tmp"])
+        self._run_vendor()
+        subtree = self.consumer / "vendor/libanswer"
+        self.assertTrue((subtree / "docs/guide.txt").is_file())
+        self.assertFalse((subtree / "remove.tmp").exists())
         self.assertEqual(git(self.consumer, "status", "--porcelain"), "")
 
     def test_dirty_worktree_reports_clean_error_without_traceback(self):

@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-# vendor v0.14 (2026-10-20) (c20dc7ffef0ba03f)
+# vendor v0.19 (2026-10-21) (1f82c3b05c71ef84)
 #
 # Updates vendor dependencies via git subtrees
 #
 # https://github.com/Rafflesiaceae/vendor
 #
 # Requirements:
-#   Python >= 3.9 (standard library only; uses str.removeprefix).
+#   Python standard library only; never require third-party Python packages.
+#   - python >= 3.11
 #   Git >= 2.13.0 with git subtree installed (uses rev-parse --absolute-git-dir).
 #   When using exclude: Git >= 2.22.0 and git-filter-repo >= 2.23.0 on PATH.
 import json
@@ -17,6 +18,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import tomllib
 import urllib.request
 
 from contextlib import contextmanager
@@ -25,6 +27,7 @@ from typing import Dict, List
 
 VENDOR_DIR = "./vendor"
 VENDOR_JSON_PATH = "./vendor/vendor.json"
+VENDOR_TOML_PATH = "./vendor/vendor.toml"
 VENDOR_REPLACE_JSON_PATH = "./vendor/vendor_replace.json"
 
 # Self-updates always follow the canonical script on the main branch.
@@ -485,54 +488,27 @@ def last_vendor_import(name):
     cached = load_vendor_imports().get(name)
     if cached is not None and cached["commit"] == commit:
         return cached["settings"]
-    manifest_path = VENDOR_JSON_PATH.removeprefix("./")
-    result = subprocess.run(
-        [
-            "git",
-            "show",
-            f"{commit}:{manifest_path}",
-        ],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    if result.returncode != 0:
-        # Older consumers may have committed the manifest after importing.
-        # Use its first snapshot, preserving later rule edits as updates.
+    manifest = committed_vendor_manifest(commit)
+    if manifest is None:
+        # Older consumers may have committed either format after importing.
+        # Use the first snapshot, preserving later rule edits as updates.
         snapshots = run_cmd(
             [
-                "git",
-                "log",
-                "--first-parent",
-                "--reverse",
-                "--format=%H",
-                "--diff-filter=A",
-                f"{commit}..HEAD",
-                "--",
-                manifest_path,
+                "git", "log", "--first-parent", "--reverse", "--format=%H",
+                "--diff-filter=A", f"{commit}..HEAD", "--",
+                VENDOR_JSON_PATH.removeprefix("./"),
+                VENDOR_TOML_PATH.removeprefix("./"),
             ]
         ).splitlines()
         if not snapshots:
             return None
-        manifest = json.loads(
-            run_cmd(
-                [
-                    "git",
-                    "show",
-                    f"{snapshots[0]}:{manifest_path}",
-                ]
-            )
-        )
+        manifest = committed_vendor_manifest(snapshots[0])
         subject = run_cmd(["git", "show", "-s", "--format=%s", commit])
-        # A manifest first tracked at a newer revision cannot describe the
-        # earlier import, even if it already matches the current manifest.
+        # A newer revision cannot describe settings used by an earlier import.
         manifest = [
-            entry
-            for entry in manifest
+            entry for entry in manifest
             if subject == f"vendor: Upgraded {name} to '{entry['rev']}'"
         ]
-    else:
-        manifest = json.loads(result.stdout)
     for entry in manifest:
         if entry["name"] == name:
             return dict(entry, exclude=entry.get("exclude", []))
@@ -880,25 +856,72 @@ def manage_subtree(repo_url, name, rev, exclude=None):
     print(f"Subtree at '{target_path}' is now at revision '{rev}'.\n")
 
 
-def load_vendor_config() -> List[VendorConfig]:
-    if not os.path.exists(VENDOR_JSON_PATH):
-        raise FileNotFoundError(
-            f"Vendor configuration file '{VENDOR_JSON_PATH}' not found."
+def vendor_manifest_path():
+    """Select exactly one supported manifest before modifying the worktree."""
+    paths = [
+        path for path in (VENDOR_JSON_PATH, VENDOR_TOML_PATH) if os.path.exists(path)
+    ]
+    if len(paths) > 1:
+        raise ValueError(
+            f"Both '{VENDOR_JSON_PATH}' and '{VENDOR_TOML_PATH}' exist. "
+            "Choose one format and remove the other file."
         )
-    with open(VENDOR_JSON_PATH, "r") as f:
-        config_data = json.load(f)
-        if not config_data:
+    if not paths:
+        raise FileNotFoundError(
+            f"Vendor configuration not found: create either '{VENDOR_JSON_PATH}' "
+            f"or '{VENDOR_TOML_PATH}'."
+        )
+    return paths[0]
+
+
+def parse_vendor_manifest(contents, path):
+    """Decode either format using only the Python standard library."""
+    if path.endswith(".toml"):
+        config_data = tomllib.loads(contents).get("vendor", [])
+    else:
+        config_data = json.loads(contents)
+    if not isinstance(config_data, list):
+        raise ValueError(f"Vendor configuration '{path}' must contain a list of entries.")
+    if not config_data:
+        raise ValueError(f"Vendor configuration file '{path}' is empty.")
+    for entry in config_data:
+        if not isinstance(entry, dict) or not all(
+            key in entry for key in ("repo_url", "name", "rev")
+        ):
             raise ValueError(
-                f"Vendor configuration file '{VENDOR_JSON_PATH}' is empty."
+                "Each vendor config must include 'repo_url', 'name', and 'rev'"
             )
-        configs = []
-        for vendor in config_data:
-            if not all(k in vendor for k in ("repo_url", "name", "rev")):
-                raise ValueError(
-                    "Each vendor config must include 'repo_url', 'name', and 'rev'"
-                )
-            configs.append(VendorConfig(**vendor))
-        return configs
+    return config_data
+
+
+def committed_vendor_manifest(commit):
+    """Read the format present at an import, independent of today's format."""
+    manifests = []
+    for path in (VENDOR_JSON_PATH, VENDOR_TOML_PATH):
+        result = subprocess.run(
+            ["git", "show", f"{commit}:{path.removeprefix('./')}"],
+            encoding="utf-8", stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        if result.returncode == 0:
+            manifests.append((path, result.stdout))
+    if len(manifests) > 1:
+        raise ValueError(
+            f"Both vendor.json and vendor.toml exist at commit {commit}. "
+            "Choose one manifest format."
+        )
+    if not manifests:
+        return None
+    path, contents = manifests[0]
+    return parse_vendor_manifest(contents, path)
+
+
+def load_vendor_config(path=None) -> List[VendorConfig]:
+    """Load JSON entries or TOML [[vendor]] tables with the same fields."""
+    if path is None:
+        path = vendor_manifest_path()
+    with open(path, "r", encoding="utf-8") as manifest:
+        config_data = parse_vendor_manifest(manifest.read(), path)
+    return [VendorConfig(**entry) for entry in config_data]
 
 
 def main(argv=None):
@@ -906,7 +929,7 @@ def main(argv=None):
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Manage git subtree based on vendor.json"
+        description="Manage git subtree based on vendor.json or vendor.toml"
     )
     parser.add_argument(
         "--update",
@@ -945,6 +968,14 @@ def main(argv=None):
         restore_all_replacements()
         return 0
 
+    # Reject ambiguous or invalid manifests before applying local replacements.
+    try:
+        manifest_path = vendor_manifest_path()
+        vendor_configs = load_vendor_config(manifest_path)
+    except (FileNotFoundError, ValueError) as e:
+        print(e)
+        return 1
+
     try:
         replacements = apply_replacements()
     except (ValueError, json.JSONDecodeError) as e:
@@ -953,13 +984,7 @@ def main(argv=None):
     if replacements:
         print()
 
-    try:
-        vendor_configs = load_vendor_config()
-    except (FileNotFoundError, ValueError) as e:
-        print(e)
-        return 1
-
-    print(f"Updating subtrees according to: '{VENDOR_JSON_PATH}'\n")
+    print(f"Updating subtrees according to: '{manifest_path}'\n")
     for vendor in vendor_configs:
         # A replaced dependency is a symlink to a local directory, pulling a
         # subtree into it would write through the link and defeat the purpose.

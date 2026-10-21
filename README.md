@@ -2,14 +2,14 @@
 
 Updates vendor dependencies via git subtrees.
 
-`vendor.py` reads a `vendor/vendor.json` manifest and adds or updates a git
+`vendor.py` reads a `vendor/vendor.json` or `vendor/vendor.toml` manifest and adds or updates a git
 subtree under `vendor/<name>` for every entry, so third-party sources are
 checked into your repository at a pinned revision instead of being fetched at
 build time.
 
 ## Requirements
 
-- Python 3 (standard library only)
+- Python >= 3.11 (standard library only; no third-party Python packages)
 - `git` (with `git subtree` available)
 - `git-filter-repo` on `PATH` when any dependency uses `exclude`
 
@@ -69,6 +69,28 @@ requires all three fields:
 ]
 ```
 
+Alternatively, create `vendor/vendor.toml` using `[[vendor]]` tables:
+
+```toml
+[[vendor]]
+repo_url = "https://github.com/example/libfoo.git"
+name = "libfoo"
+rev = "v1.4.2"
+exclude = ["docs/", "tests/", "*.pdf"]
+
+[[vendor]]
+repo_url = "git@github.com:example/libbar.git"
+name = "libbar"
+rev = "9f1c2ab"
+```
+
+Choose exactly one manifest format. If both `vendor/vendor.json` and
+`vendor/vendor.toml` exist, the script exits with an error before applying
+replacements or updating dependencies. TOML uses Python's standard library
+`tomllib` module and requires Python >= 3.11; no Python packages are needed.
+Both formats use the same fields and support exclusions. Historical import
+settings are read from either format, including after switching formats.
+
 | Field      | Description                                                       |
 | ---------- | ----------------------------------------------------------------- |
 | `repo_url` | Any URL `git` can clone from.                                     |
@@ -90,7 +112,7 @@ A leading `/` anchors a pattern at the upstream root, a trailing `/` matches
 directories, and `**` matches across directory levels. Later `!` rules can
 keep matching files, subject to gitignore's rule that an excluded parent
 directory must be included again before its children can be included. Each
-list item is one gitignore line; JSON backslashes must be escaped as usual.
+list item is one gitignore line; backslashes must be escaped as required by the chosen format.
 Only the manifest rules apply, independent of upstream `.gitignore` files
 and your personal Git ignore settings.
 
@@ -113,7 +135,7 @@ Successful imports remember their settings locally in
 `.git/vendor_imports.json`, tied to each dependency's import commit. This
 lets unchanged dependencies skip fetching and filtering even when the
 manifest is untracked. Without local settings, the script reads
-`vendor/vendor.json` at the import commit, or its first committed snapshot
+the JSON or TOML manifest at the import commit, or its first committed snapshot
 afterward if that snapshot still names the imported revision.
 
 With recorded settings, after a fresh clone or garbage collection, the
