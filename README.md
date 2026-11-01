@@ -99,6 +99,7 @@ switching formats.
 | `http`     | HTTP or HTTPS URL to a ZIP archive, used instead of `repo_url`. |
 | `strip_root` | Optional ZIP-only boolean overriding the archive layout heuristic. |
 | `exclude`  | Optional list of gitignore patterns to remove before importing. Defaults to `[]`. |
+| `submodules` | Git-only: `true` to flatten all submodules, or an `include`/`exclude` table of submodule paths. Defaults to `false`. |
 
 ### ZIP dependencies
 
@@ -140,6 +141,56 @@ clean tracked working tree and refuse to replace destinations containing
 untracked or ignored local files. Local replacements work for ZIP sources
 as well. Archive handling uses only Python's standard library, with no
 `unzip` command or Python packages required.
+
+### Including Git submodules
+
+By default, submodules are not initialized or downloaded; the upstream Git
+links and `.gitmodules` files are imported as before. Enable submodule
+handling per dependency to replace selected Git links with ordinary tracked
+files, including nested submodules at their pinned commits. Consumers can
+then clone the vendored files without initializing submodules.
+
+Choose one of these TOML settings inside the dependency's table:
+
+```toml
+[libfoo]
+repo_url = "https://github.com/example/libfoo.git"
+rev = "v1.4.2"
+
+# Include every submodule recursively.
+submodules = true
+
+# Alternatively, include only these submodules and their descendants.
+# submodules = { include = ["third_party/helper", "deps/parser"] }
+
+# Alternatively, include all except these submodules and their descendants.
+# submodules = { exclude = ["third_party/large-assets"] }
+```
+
+The equivalent JSON values are `"submodules": true`,
+`"submodules": {"include": ["third_party/helper", "deps/parser"]}`, or
+`"submodules": {"exclude": ["third_party/large-assets"]}`.
+
+Lists contain exact submodule paths relative to the dependency root, using
+`/` separators, without leading or trailing slashes or glob patterns. Use
+exactly one of `include` or `exclude`. An empty include list selects none;
+an empty exclude list selects all. A nested include such as
+`deps/parser/third_party/helper` also includes its ancestor submodules'
+files so Git can reach the selected nested module, while other nested
+submodules remain omitted. Unknown include paths cause an error.
+
+When enabled, submodule handling removes unselected Git links and all
+`.gitmodules` files from the imported snapshot. Unselected submodules are
+not downloaded. Ordinary `exclude` rules apply after flattening and can
+remove files inside included submodules. Submodule handling itself requires
+only Git; `git-filter-repo` is needed only when using ordinary `exclude`
+rules.
+
+Changing the selection triggers an update even at the same `rev`. Settings
+are remembered alongside exclusion rules, allowing missing subtree split
+objects to be rebuilt after cloning or Git garbage collection.
+Local edits participate in normal subtree merges; removing an edited
+submodule can require conflict resolution.
 
 ### Excluding upstream paths
 

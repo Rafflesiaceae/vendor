@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# vendor v0.24 (2026-10-21) (b045390d30dcef76)
+# vendor v0.25 (2026-11-01) (2271f37bc698be09)
 #
 # Updates vendor dependencies via git subtrees or HTTP ZIP archives
 #
@@ -55,8 +55,28 @@ class VendorConfig:
     exclude: List[str] = field(default_factory=list)
     http: str = None
     strip_root: bool = None
+    submodules: bool | dict[str, List[str]] = False
 
     def __post_init__(self):
+        # Selection paths address submodules relative to the dependency root.
+        selection = self.submodules
+        if not isinstance(selection, bool):
+            if (
+                not isinstance(selection, dict)
+                or len(selection) != 1
+                or next(iter(selection)) not in ("include", "exclude")
+            ):
+                raise ValueError("'submodules' must be a boolean or an include/exclude table")
+            paths = next(iter(selection.values()))
+            if not isinstance(paths, list) or any(
+                not isinstance(path, str)
+                or any(character in path for character in "\\\n\r\0")
+                or any(part in ("", ".", "..", ".git") for part in path.split("/"))
+                for path in paths
+            ):
+                raise ValueError("Submodule selection must contain relative directory paths")
+        if self.http is not None and selection is not False:
+            raise ValueError("'submodules' is only supported for Git dependencies")
         # Both source types share a mandatory destination and exclusion rules.
         if not isinstance(self.name, str) or not self.name:
             raise ValueError("Each vendor config requires a non-empty 'name'")
@@ -493,12 +513,13 @@ def load_vendor_imports():
         return {}
 
 
-def remember_vendor_import(name, repo_url, rev, exclude):
+def remember_vendor_import(name, repo_url, rev, exclude, submodules=False):
     """Remember validated settings for this dependency's current import."""
     imports = load_vendor_imports()
     imports[name] = {
         "commit": last_vendor_import_commit(name),
-        "settings": dict(name=name, repo_url=repo_url, rev=rev, exclude=exclude),
+        "settings": dict(name=name, repo_url=repo_url, rev=rev, exclude=exclude,
+                         submodules=submodules),
     }
     with open(os.path.join(git_dir(), "vendor_imports.json"), "w") as state:
         json.dump(imports, state, indent=2, sort_keys=True)
@@ -563,13 +584,85 @@ def last_subtree_split(target_path):
     return None
 
 
+def flatten_submodules(repository, source, selection, temporary):
+    """Build a reproducible snapshot containing selected submodules as files."""
+    checkout = os.path.join(temporary, "checkout")
+    subprocess.check_call(
+        ["git", "-C", repository, "worktree", "add", "--quiet", "--detach", checkout, source]
+    )
+    entries = []
+    found = set()
+
+    def collect(directory, prefix=""):
+        # Read tracked objects directly, preserving modes, symlinks and files
+        # ignored by upstream rules without staging checkout-generated files.
+        tree = subprocess.check_output(["git", "ls-tree", "-rz", "HEAD"], cwd=directory)
+        for entry in tree.split(b"\0"):
+            if not entry:
+                continue
+            metadata, filename = entry.split(b"\t", 1)
+            mode, _, object_id = metadata.split()
+            path = prefix + os.fsdecode(filename)
+            if mode != b"160000":
+                if filename.split(b"/")[-1] != b".gitmodules":
+                    entries.append(mode + b" " + object_id + b"\t" + os.fsencode(path) + b"\0")
+                continue
+            found.add(path)
+            if isinstance(selection, dict):
+                includes = selection.get("include")
+                excludes = selection.get("exclude", [])
+                if includes is not None and not any(
+                    path == item or path.startswith(item + "/") or item.startswith(path + "/")
+                    for item in includes
+                ):
+                    continue
+                if any(path == item or path.startswith(item + "/") for item in excludes):
+                    continue
+            subprocess.check_call(
+                ["git", "--literal-pathspecs", "-c", "submodule.recurse=false", "-C", directory,
+                 "submodule", "update", "--init", "--checkout", "--", os.fsdecode(filename)]
+            )
+            module = os.path.join(directory, os.fsdecode(filename))
+            # Copy the module's objects into the disposable import repository;
+            # the flattened tree must remain readable after checkout cleanup.
+            subprocess.check_call(
+                ["git", "-C", repository, "fetch", "--quiet", "--no-tags", module, "HEAD"]
+            )
+            collect(module, path + "/")
+
+    collect(checkout)
+    if isinstance(selection, dict) and "include" in selection:
+        missing = set(selection["include"]) - found
+        if missing:
+            raise ValueError("Unknown included submodule paths: " + ", ".join(sorted(missing)))
+    # Only the disposable worktree index is replaced. Git constructs the tree
+    # from upstream objects, independent of local checkout/filter settings.
+    subprocess.check_call(["git", "read-tree", "--empty"], cwd=checkout)
+    subprocess.run(
+        ["git", "update-index", "-z", "--index-info"], cwd=checkout,
+        input=b"".join(entries), check=True,
+    )
+    tree = run_cmd(["git", "write-tree"], cwd=checkout)
+    # Fixed metadata makes split objects reproducible after cloning or GC.
+    commit = (
+        f"tree {tree}\nparent {source}\n"
+        "author vendor.py <vendor@example.invalid> 0 +0000\n"
+        "committer vendor.py <vendor@example.invalid> 0 +0000\n\n"
+        "Flatten vendored submodules\n"
+    ).encode("ascii")
+    return subprocess.check_output(
+        ["git", "hash-object", "-t", "commit", "-w", "--stdin"],
+        cwd=repository, input=commit,
+    ).decode("ascii").strip()
+
+
 @contextmanager
-def filtered_repository(repo_url, rev, patterns):
+def filtered_repository(repo_url, rev, patterns, submodules=False):
     """Filter a disposable upstream history, yielding repo, ref, source SHA."""
-    if not patterns:
+    if not patterns and not submodules:
         yield repo_url, rev, None
         return
-    if shutil.which("git-filter-repo") is None:
+    if patterns and shutil.which("git-filter-repo") is None:
         raise ValueError("'exclude' requires git-filter-repo on PATH")
     # Local URLs are resolved from the consumer, before changing cwd to the
     # temporary bare repository used for fetching and filtering.
@@ -579,6 +672,9 @@ def filtered_repository(repo_url, rev, patterns):
     with tempfile.TemporaryDirectory(prefix="vendor-filter-") as temporary:
         repository = os.path.join(temporary, "upstream.git")
         subprocess.check_call(["git", "init", "--bare", "--quiet", repository])
+        # Relative submodule URLs resolve against the original upstream URL.
+        if submodules:
+            subprocess.check_call(["git", "-C", repository, "remote", "add", "origin", repo_url])
         subprocess.check_call(
             [
                 "git",
@@ -598,6 +694,7 @@ def filtered_repository(repo_url, rev, patterns):
             ],
             cwd=repository,
         )
+        snapshot = flatten_submodules(repository, source, submodules, temporary) if submodules else source
         subprocess.check_call(
             [
                 "git",
@@ -605,7 +702,7 @@ def filtered_repository(repo_url, rev, patterns):
                 repository,
                 "update-ref",
                 "refs/heads/vendor",
-                source,
+                snapshot,
             ]
         )
         subprocess.check_call(
@@ -618,6 +715,10 @@ def filtered_repository(repo_url, rev, patterns):
                 "refs/heads/vendor",
             ]
         )
+
+        if not patterns:
+            yield repository, "refs/heads/vendor", source
+            return
 
         # Ask Git to interpret the manifest as the only ignore file in an
         # empty worktree. Upstream .gitignores and user exclusions must not
@@ -722,13 +823,14 @@ def restore_subtree_split(repo_url, previous, split, filtered=None):
         if exists.returncode == 0:
             return
 
-    if previous and previous["exclude"]:
+    if previous and (previous["exclude"] or previous.get("submodules", False)):
         with filtered_repository(
-            previous["repo_url"], previous["rev"], previous["exclude"]
+            previous["repo_url"], previous["rev"], previous["exclude"],
+            previous.get("submodules", False),
         ) as (repository, ref, _):
             rebuilt = run_cmd(["git", "rev-parse", ref], cwd=repository)
             if rebuilt != split:
-                raise ValueError("could not reproduce the previous filtered subtree")
+                raise ValueError("could not reproduce the previous prepared subtree")
             subprocess.check_call(["git", "fetch", "--no-tags", repository, ref])
     else:
         # Older imports and imports without exclusions reference the original
@@ -736,13 +838,14 @@ def restore_subtree_split(repo_url, previous, split, filtered=None):
         subprocess.check_call(["git", "fetch", "--no-tags", repo_url, split])
 
 
-def is_subtree_up_to_date(target_path, rev, exclude=None):
+def is_subtree_up_to_date(target_path, rev, exclude=None, submodules=False):
     previous = last_vendor_import(os.path.relpath(target_path, "vendor"))
     if previous is not None:
-        return previous["rev"] == rev and previous["exclude"] == (exclude or [])
+        return (previous["rev"] == rev and previous["exclude"] == (exclude or [])
+                and previous.get("submodules", False) == submodules)
     # Existing manifests and pre-feature imports retain their old skip check;
     # adding any exclusion must still perform the first filtered import.
-    if exclude:
+    if exclude or submodules:
         return False
     if not os.path.exists(target_path):
         return False
@@ -779,12 +882,12 @@ def require_clean_worktree_for_subtree(target_path, operation="git subtree"):
     raise SystemExit(1)
 
 
-def manage_subtree(repo_url, name, rev, exclude=None):
+def manage_subtree(repo_url, name, rev, exclude=None, submodules=False):
     target_path = os.path.join("vendor", name)
     print(f"Adding/updating subtree at {target_path}...")
 
     exclude = exclude or []
-    if is_subtree_up_to_date(target_path, rev, exclude):
+    if is_subtree_up_to_date(target_path, rev, exclude, submodules):
         print(
             f"Subtree at '{target_path}' is already at revision '{rev}', skipping update."
         )
@@ -796,9 +899,9 @@ def manage_subtree(repo_url, name, rev, exclude=None):
     split = last_subtree_split(target_path)
     head_before = run_cmd(["git", "rev-parse", "HEAD"])
     try:
-        with filtered_repository(repo_url, rev, exclude) as (repository, ref, _):
+        with filtered_repository(repo_url, rev, exclude, submodules) as (repository, ref, _):
             restore_subtree_split(
-                repo_url, previous, split, repository if exclude else None
+                repo_url, previous, split, repository if exclude or submodules else None
             )
             # An empty import has no tracked prefix. Start a new squash when
             # adding content again: pulling into a missing tree can make Git
@@ -849,7 +952,7 @@ def manage_subtree(repo_url, name, rev, exclude=None):
             ]
         )
         if last_message == f"vendor: Upgraded {name} to '{rev}'":
-            remember_vendor_import(name, repo_url, rev, exclude)
+            remember_vendor_import(name, repo_url, rev, exclude, submodules)
             print(
                 f"Subtree at '{target_path}' is already at revision '{rev}', skipping update."
             )
@@ -880,7 +983,7 @@ def manage_subtree(repo_url, name, rev, exclude=None):
     finally:
         os.unlink(tmpfile_path)
 
-    remember_vendor_import(name, repo_url, rev, exclude)
+    remember_vendor_import(name, repo_url, rev, exclude, submodules)
     print(f"Subtree at '{target_path}' is now at revision '{rev}'.\n")
 
 
@@ -1177,7 +1280,7 @@ def main(argv=None):
                 print(f"Cannot update ZIP dependency '{vendor.name}': {error}", file=sys.stderr)
                 return 1
         else:
-            manage_subtree(vendor.repo_url, vendor.name, vendor.rev, vendor.exclude)
+            manage_subtree(vendor.repo_url, vendor.name, vendor.rev, vendor.exclude, vendor.submodules)
     return 0
 
 
