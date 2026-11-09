@@ -523,7 +523,7 @@ class VendorIntegrationTests(unittest.TestCase):
         patterns = [
             "docs/", "/root-only.txt", "*.tmp", "!keep.tmp",
             "/assets/**/generated?.[ch]", "/samples/*", "!/samples/keep.c",
-            r"\#notes", r"\!notice", "trailing\\ ", "CASE-ONLY",
+            r"\#notes", r"\!notice", "trailing\\ ",
         ]
         self._write_exclusion_manifest("filtered-v1", patterns)
         # User ignore settings must not change filtered history or strip
@@ -618,7 +618,7 @@ class VendorIntegrationTests(unittest.TestCase):
     def test_changing_rules_at_same_revision_including_empty_subtree(self):
         """Add, change, and remove rules without losing subtree ancestry."""
         self._prepare_exclusion_source()
-        for patterns in ([], ["docs/"], ["*.tmp"], ["*"], [], ["absent-path"]):
+        for patterns in ([], ["docs/"], ["*.tmp"], ["*"], [], ["root-only.txt"]):
             with self.subTest(patterns=patterns):
                 self._write_exclusion_manifest("filtered-v1", patterns)
                 manifest_commit = git(self.consumer, "rev-parse", "HEAD")
@@ -637,6 +637,34 @@ class VendorIntegrationTests(unittest.TestCase):
                 self.assertIn("already at revision", self._run_vendor())
                 self.assertEqual(git(self.consumer, "rev-parse", "HEAD"), head)
                 self.assertEqual(git(self.consumer, "status", "--porcelain"), "")
+
+    @unittest.skipUnless(shutil.which("git-filter-repo"), "requires git-filter-repo")
+    def test_exclude_patterns_must_match_the_upstream_tree(self):
+        """Missing paths fail on every update, even after being stripped."""
+        self._prepare_exclusion_source()
+        # Patterns are case sensitive, so this one names no upstream path.
+        self._write_exclusion_manifest("filtered-v1", ["docs/", "CASE-ONLY"])
+        result = self._run_vendor_result()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("'CASE-ONLY'", result.stderr)
+        self.assertNotIn("'docs/'", result.stderr)
+        self.assertFalse((self.consumer / "vendor/libanswer").exists())
+
+        # A valid import strips docs/, which must not satisfy later checks:
+        # v3 removes nothing, but a pattern for a path gone upstream fails.
+        self._write_exclusion_manifest("filtered-v1", ["docs/", "remove.tmp"])
+        self._run_vendor()
+        self.assertFalse((self.consumer / "vendor/libanswer/docs").exists())
+        # remove.tmp is deleted upstream in v2, so the update must be refused
+        # and leave the earlier import untouched.
+        head = git(self.consumer, "rev-parse", "HEAD")
+        self._write_exclusion_manifest("filtered-v2", ["docs/", "remove.tmp"])
+        manifest_head = git(self.consumer, "rev-parse", "HEAD")
+        result = self._run_vendor_result()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("'remove.tmp'", result.stderr)
+        self.assertEqual(git(self.consumer, "rev-parse", "HEAD"), manifest_head)
+        self.assertNotEqual(head, manifest_head)
 
     @unittest.skipUnless(shutil.which("git-filter-repo"), "requires git-filter-repo")
     def test_rule_change_after_clone_rebuilds_previous_filter(self):
@@ -845,11 +873,25 @@ class VendorIntegrationTests(unittest.TestCase):
 
         # A subsequent archive replaces deleted paths rather than accumulating
         # files from older releases in the vendored snapshot.
-        contents = self._zip_bytes({"release/lib.c": "version two"})
+        contents = self._zip_bytes({
+            "release/lib.c": "version two", "release/docs/guide": "excluded",
+        })
         self.assertEqual(self._run_with_zip_download(contents)[0], 0)
         self.assertEqual((target / "lib.c").read_text(), "version two")
         self.assertFalse((target / "obsolete.c").exists())
         self.assertEqual(git(self.consumer, "status", "--porcelain"), "")
+
+    def test_zip_exclude_patterns_must_match_the_archive(self):
+        """A pattern naming nothing in the archive aborts before any change."""
+        manifest = self.consumer / "vendor/vendor.json"
+        manifest.write_text(json.dumps([{
+            "name": "archive", "http": "https://example.invalid/lib.zip",
+            "exclude": ["docs/", "missing.txt"],
+        }]))
+        commit_all(self.consumer, "Configure ZIP dependency")
+        contents = self._zip_bytes({"release/lib.c": "one", "release/docs/guide": "x"})
+        self.assertEqual(self._run_with_zip_download(contents)[0], 1)
+        self.assertFalse((self.consumer / "vendor/archive").exists())
 
     def test_toml_can_mix_git_and_zip_sources_with_layout_override(self):
         """Mixed manifests route each source independently and honor strip_root."""

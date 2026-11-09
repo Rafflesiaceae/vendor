@@ -220,6 +220,15 @@ so later upstream changes to those files cannot cause merge conflicts.
 Local edits to retained files still participate in normal three-way merges
 and can conflict with overlapping upstream edits.
 
+Every pattern must match at least one path in the upstream tree at the
+selected `rev` (for ZIP dependencies: in the downloaded archive), otherwise the
+update fails with an error naming the offending patterns. The check runs
+against the freshly fetched upstream content on every update, not against the
+vendored copy, so paths that were stripped by an earlier import still count.
+Negated (`!`) patterns and comment lines are not checked. A pattern that only
+matches files deleted in older history, or that no longer exists at a newer
+`rev`, must be removed from `exclude`.
+
 Changing or removing `exclude` triggers an update even when `rev` stays the
 same. Adding rules to an existing dependency removes matching vendored
 files; removing rules restores upstream files. Local edits to files being

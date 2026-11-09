@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# vendor v0.25 (2026-11-01) (2271f37bc698be09)
+# vendor v0.26 (2026-11-09) (fcf3c547b5d76fa4)
 #
 # Updates vendor dependencies via git subtrees or HTTP ZIP archives
 #
@@ -656,9 +656,53 @@ def flatten_submodules(repository, source, selection, temporary):
     ).decode("ascii").strip()
 
 
+def require_exclude_patterns_match(paths, patterns, temporary, origin):
+    """Fail unless every positive exclude pattern matches a path in `paths`.
+
+    `paths` are the NUL-free byte paths of the freshly fetched upstream tree.
+    The check must run on that pristine tree (never on the vendored copy, from
+    which earlier excludes were already stripped), so a stale or misspelled
+    pattern is reported on every update instead of silently doing nothing.
+    """
+    matcher = os.path.join(temporary, "pattern-check")
+    subprocess.check_call(["git", "init", "--quiet", matcher])
+    rules_path = os.path.join(matcher, ".git", "info", "exclude")
+    stdin = b"\0".join(paths) + b"\0" if paths else b""
+    unmatched = []
+    for pattern in patterns:
+        # Blank lines and comments are not rules, and a negation only
+        # re-includes paths other patterns removed, so neither names a path.
+        if not pattern.strip() or pattern.startswith(("#", "!")):
+            continue
+        # Test each rule in isolation: `check-ignore` only reports whether
+        # the combined rules match, which would let one pattern hide another.
+        with open(rules_path, "w") as rules:
+            rules.write(pattern + "\n")
+        result = subprocess.run(
+            ["git", "-C", matcher, "-c", f"core.excludesFile={os.devnull}",
+             "-c", "core.ignoreCase=false", "check-ignore", "--no-index",
+             "--quiet", "--stdin", "-z"],
+            input=stdin, stdout=subprocess.DEVNULL,
+        )
+        if result.returncode == 1:
+            unmatched.append(pattern)
+        elif result.returncode != 0:
+            result.check_returncode()
+    if unmatched:
+        raise ValueError(
+            f"'exclude' patterns match nothing in {origin}: "
+            + ", ".join(repr(pattern) for pattern in unmatched)
+        )
+
+
 @contextmanager
-def filtered_repository(repo_url, rev, patterns, submodules=False):
-    """Filter a disposable upstream history, yielding repo, ref, source SHA."""
+def filtered_repository(repo_url, rev, patterns, submodules=False, check_patterns=True):
+    """Filter a disposable upstream history, yielding repo, ref, source SHA.
+
+    `check_patterns` requires every exclude pattern to match the upstream tree
+    at `rev`. Rebuilding a previously imported snapshot disables it, because
+    those patterns were validated when that snapshot was first imported.
+    """
     if not patterns and not submodules:
         yield repo_url, rev, None
         return
@@ -719,6 +763,18 @@ def filtered_repository(repo_url, rev, patterns, submodules=False):
         if not patterns:
             yield repository, "refs/heads/vendor", source
             return
+
+        if check_patterns:
+            # Validate against the tip tree of what will be vendored (after
+            # submodule flattening), not against historical file names.
+            tip_paths = subprocess.check_output(
+                ["git", "ls-tree", "-r", "-z", "--name-only", snapshot],
+                cwd=repository,
+            ).split(b"\0")
+            require_exclude_patterns_match(
+                [path for path in tip_paths if path], patterns, temporary,
+                f"the upstream tree at '{rev}'",
+            )
 
         # Ask Git to interpret the manifest as the only ignore file in an
         # empty worktree. Upstream .gitignores and user exclusions must not
@@ -826,7 +882,7 @@ def restore_subtree_split(repo_url, previous, split, filtered=None):
     if previous and (previous["exclude"] or previous.get("submodules", False)):
         with filtered_repository(
             previous["repo_url"], previous["rev"], previous["exclude"],
-            previous.get("submodules", False),
+            previous.get("submodules", False), check_patterns=False,
         ) as (repository, ref, _):
             rebuilt = run_cmd(["git", "rev-parse", ref], cwd=repository)
             if rebuilt != split:
@@ -1033,6 +1089,11 @@ def exclude_zip_paths(source, patterns, temporary):
         os.path.relpath(os.path.join(directory, filename), source)
         for directory, _, filenames in os.walk(source) for filename in filenames
     ]
+    # The archive is downloaded fresh on every run, so every pattern is
+    # checked against the pristine contents before anything is removed.
+    require_exclude_patterns_match(
+        [os.fsencode(path) for path in paths], patterns, temporary, "the archive"
+    )
     result = subprocess.run(
         ["git", "-C", matcher, "-c", f"core.excludesFile={os.devnull}",
          "-c", "core.ignoreCase=false", "check-ignore", "--no-index", "--stdin", "-z"],
