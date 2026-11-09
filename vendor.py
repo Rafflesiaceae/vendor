@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
-# vendor v0.26 (2026-11-09) (fcf3c547b5d76fa4)
+# vendor v0.27 (2026-11-13) (9106adb9a18b4556)
 #
 # Updates vendor dependencies via git subtrees or HTTP ZIP archives
-#
-# https://github.com/Rafflesiaceae/vendor
 #
 # Requirements:
 #   Python standard library only; never require third-party Python packages.
@@ -47,6 +45,15 @@ EXCLUDE_BEGIN = "# BEGIN vendor.py replace (managed section, do not edit)"
 EXCLUDE_END = "# END vendor.py replace"
 
 
+def is_safe_vendor_name(name):
+    """Whether `name` is a plain relative directory below vendor/."""
+    return not (
+        any(character in name for character in "\\:*?[]")
+        or any(part in ("", ".", "..", ".git") for part in name.split("/"))
+        or name in ("vendor.json", "vendor.toml", "vendor_replace.json")
+    )
+
+
 @dataclass
 class VendorConfig:
     repo_url: str = None
@@ -56,8 +63,27 @@ class VendorConfig:
     http: str = None
     strip_root: bool = None
     submodules: bool | dict[str, List[str]] = False
+    # Marks a directory below vendor/ that is deliberately not synced by this
+    # script, shielding it from the removal of unlisted dependencies.
+    keep: bool = False
 
     def __post_init__(self):
+        if not isinstance(self.keep, bool):
+            raise ValueError("'keep' must be a boolean")
+        if self.keep:
+            # A kept directory is only a name, so no sync settings may be mixed in.
+            if not isinstance(self.name, str) or not is_safe_vendor_name(self.name):
+                raise ValueError("'keep' name must be a relative directory below vendor/")
+            if (
+                self.repo_url is not None or self.http is not None
+                or self.rev is not None or self.exclude
+                or self.strip_root is not None or self.submodules is not False
+            ):
+                raise ValueError(
+                    f"'{self.name}' is marked 'keep' and cannot also define a "
+                    "source, 'rev', 'exclude', 'strip_root' or 'submodules'"
+                )
+            return
         # Selection paths address submodules relative to the dependency root.
         selection = self.submodules
         if not isinstance(selection, bool):
@@ -89,11 +115,7 @@ class VendorConfig:
                 raise ValueError("'strip_root' must be a boolean")
             # Archive imports replace their destination, so never allow them
             # to address parent directories or the consumer's manifest files.
-            if (
-                any(character in self.name for character in "\\:*?[]")
-                or any(part in ("", ".", "..", ".git") for part in self.name.split("/"))
-                or self.name in ("vendor.json", "vendor.toml", "vendor_replace.json")
-            ):
+            if not is_safe_vendor_name(self.name):
                 raise ValueError("ZIP 'name' must be a relative directory below vendor/")
         elif not self.rev:
             raise ValueError("Git vendor configs require 'repo_url', 'name', and 'rev'")
@@ -486,20 +508,29 @@ def print_replacement_status():
 
 
 def last_vendor_import_commit(name):
-    """Find the latest import independently of excluded or empty paths."""
-    return run_cmd(
+    """Find the latest import independently of excluded or empty paths.
+
+    A later removal commit ends the history of the dependency, so re-adding
+    it afterwards is treated as a fresh import instead of "already up to date".
+    """
+    latest = run_cmd(
         [
             "git",
             "log",
             "--first-parent",
             "-1",
-            "--format=%H",
+            "--format=%H%x09%s",
             "--extended-regexp",
             f"--grep=^vendor: Upgraded {re.escape(name)} to '",
+            f"--grep=^vendor: Removed {re.escape(name)}$",
             "HEAD",
             "--",
         ]
     )
+    commit, _, subject = latest.partition("\t")
+    if subject == f"vendor: Removed {name}":
+        return ""
+    return commit
 
 
 def load_vendor_imports():
@@ -952,7 +983,9 @@ def manage_subtree(repo_url, name, rev, exclude=None, submodules=False):
     require_clean_worktree_for_subtree(target_path)
 
     previous = last_vendor_import(name)
-    split = last_subtree_split(target_path)
+    # Without an existing prefix a plain `subtree add` follows, which needs no
+    # earlier split (e.g. after the dependency was removed and listed again).
+    split = last_subtree_split(target_path) if os.path.exists(target_path) else None
     head_before = run_cmd(["git", "rev-parse", "HEAD"])
     try:
         with filtered_repository(repo_url, rev, exclude, submodules) as (repository, ref, _):
@@ -1192,6 +1225,56 @@ def manage_zip(config):
     print(f"ZIP dependency '{config.name}' updated at '{target}'.")
 
 
+def find_unlisted_directories(configs):
+    """List directories below vendor/ that the manifest neither lists nor keeps."""
+    # Nested names such as 'group/lib' make their top-level directory managed.
+    managed = {config.name.split("/")[0] for config in configs}
+    return sorted(
+        entry.name
+        for entry in os.scandir(VENDOR_DIR)
+        # Symlinks are replacements (or the consumer's own links), not subtrees.
+        if entry.is_dir(follow_symlinks=False) and entry.name not in managed
+    )
+
+
+def remove_unlisted_directory(name):
+    """Remove a vendored dependency dropped from the manifest and commit it."""
+    target = os.path.join("vendor", name)
+    if not tracked_files(target):
+        # Nothing was vendored here, so there is no subtree to remove and
+        # deleting untracked data on the user's behalf would be destructive.
+        print(
+            f"Warning: '{target}' is not listed in the manifest and holds no "
+            "tracked files, leaving it alone. Delete it by hand or mark it with "
+            f"'keep = true' (JSON: \"keep\": true) to silence this warning.\n",
+            file=sys.stderr,
+        )
+        return
+    print(f"'{target}' is no longer listed in the manifest, removing it...")
+    require_clean_worktree_for_subtree(target, operation="subtree removal")
+    try:
+        subprocess.check_call(["git", "rm", "-r", "--quiet", "--", target])
+        # Prompt for the message like every other import, and use the subject
+        # that last_vendor_import_commit recognizes as the end of an import.
+        subprocess.check_call(
+            ["git", "commit", "--edit", "-m", f"vendor: Removed {name}"]
+        )
+    except subprocess.CalledProcessError as error:
+        print(
+            f"Failed to remove '{target}' (git exited with status "
+            f"{error.returncode}).",
+            file=sys.stderr,
+        )
+        raise SystemExit(1) from None
+    if os.path.exists(target):
+        print(
+            f"Warning: '{target}' still holds untracked or ignored files, "
+            "they were left in place.",
+            file=sys.stderr,
+        )
+    print(f"Removed '{target}'.\n")
+
+
 def vendor_manifest_path():
     """Select exactly one supported manifest before modifying the worktree."""
     paths = [
@@ -1325,7 +1408,13 @@ def main(argv=None):
         print()
 
     print(f"Updating subtrees according to: '{manifest_path}'\n")
+    # The manifest controls every directory below vendor/, so whatever it
+    # no longer lists was removed from it on purpose and has to go.
+    for name in find_unlisted_directories(vendor_configs):
+        remove_unlisted_directory(name)
     for vendor in vendor_configs:
+        if vendor.keep:
+            continue
         # A replaced dependency is a symlink to a local directory, pulling a
         # subtree into it would write through the link and defeat the purpose.
         if vendor.name in replacements:

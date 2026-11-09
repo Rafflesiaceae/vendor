@@ -100,6 +100,35 @@ switching formats.
 | `strip_root` | Optional ZIP-only boolean overriding the archive layout heuristic. |
 | `exclude`  | Optional list of gitignore patterns to remove before importing. Defaults to `[]`. |
 | `submodules` | Git-only: `true` to flatten all submodules, or an `include`/`exclude` table of submodule paths. Defaults to `false`. |
+| `keep`     | `true` marks `vendor/<name>` as a directory `vendor.py` must not touch. Cannot be combined with any other field. |
+
+### Removing dependencies and keeping other directories
+
+The manifest controls every directory directly below `vendor/`. A directory is
+either listed in the manifest or it is treated as a dependency that was
+deleted from it. On the next run, `vendor.py` removes such a directory with
+`git rm -r` and opens your editor for a commit titled
+`vendor: Removed <name>`. This works for Git subtrees and ZIP imports alike
+and needs the same clean tracked working tree as an update. Listing the
+dependency again later imports it afresh, even at the previously used `rev`.
+
+Directories that are maintained by hand but live in `vendor/` too must be
+declared with `keep`, which only needs the name:
+
+```toml
+[handwritten]
+keep = true
+```
+
+The JSON equivalent is `{"name": "handwritten", "keep": true}`.
+
+Safeguards: only directories with tracked files are ever removed. An unlisted
+directory without tracked files (for example scratch data or build output) is
+reported with a warning and left in place, as are untracked or ignored files
+inside a removed directory. Symlinks, including active replacements, are not
+treated as dependencies. For nested names such as `group/lib`, the top-level
+directory `group` counts as listed, so other contents of `group` are not
+checked.
 
 ### ZIP dependencies
 
@@ -311,6 +340,9 @@ For each entry in the manifest:
 3. The resulting commit is amended to the message
    `vendor: Upgraded <name> to '<rev>'`, which is what step 1 matches against
    on the next run.
+
+Before that, every unlisted directory below `vendor/` is removed as described
+under "Removing dependencies and keeping other directories".
 
 Because the squashed subtree history is committed to your repository, the
 vendored sources are available to anyone who clones it without any extra

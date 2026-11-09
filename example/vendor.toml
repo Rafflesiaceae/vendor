@@ -13,3 +13,8 @@ http = "https://example.com/releases/libbaz-1.0.0.zip"
 # Default heuristic: unwrap a single top-level directory; otherwise keep the ZIP layout.
 # true forces unwrapping (errors on other layouts); false keeps the layout.
 strip_root = true
+
+# A directory in vendor/ that is maintained by hand. Without this entry,
+# vendor.py would remove it as a dependency deleted from the manifest.
+[handwritten]
+keep = true

@@ -185,6 +185,33 @@ class ManifestConfigTests(unittest.TestCase):
                 self.assertEqual(vendor_module.load_vendor_config(str(path)), [expected])
 
 
+    def test_keep_entries_load_from_both_formats(self):
+        """A kept directory is just a name marked `keep` in either format."""
+        expected = vendor_module.VendorConfig(name="local", keep=True)
+        for filename, contents in (
+            ("vendor.json", '[{"name":"local","keep":true}]'),
+            ("vendor.toml", '[local]\nkeep = true\n'),
+        ):
+            with self.subTest(filename=filename):
+                path = self.root / filename
+                path.write_text(contents)
+                self.assertEqual(vendor_module.load_vendor_config(str(path)), [expected])
+
+    def test_keep_entries_reject_sources_and_unsafe_names(self):
+        """`keep` cannot be combined with sync settings or escape vendor/."""
+        for entry in (
+            {"name": "lib", "keep": True, "repo_url": "url", "rev": "v1"},
+            {"name": "lib", "keep": True, "http": "https://example.invalid/lib.zip"},
+            {"name": "lib", "keep": True, "exclude": ["docs/"]},
+            {"name": "lib", "keep": True, "submodules": True},
+            {"name": "lib", "keep": "yes"},
+            {"name": "../outside", "keep": True},
+            {"name": "vendor.json", "keep": True},
+        ):
+            with self.subTest(entry=entry), self.assertRaises(ValueError):
+                vendor_module.VendorConfig(**entry)
+
+
 class ZipExtractionTests(unittest.TestCase):
     """Archive layout choices must not permit writes outside the import."""
 
@@ -1230,6 +1257,75 @@ class VendorIntegrationTests(unittest.TestCase):
         # the fixture finishes with the same clean worktree it started with.
         (self.consumer / "vendor/vendor_replace.json").unlink()
         self.assertEqual(git(self.consumer, "status", "--porcelain"), "")
+
+
+    def _drop_from_manifest(self, *names):
+        """Commit a manifest that no longer lists the given dependencies."""
+        path = self.consumer / "vendor/vendor.json"
+        entries = [e for e in json.loads(path.read_text()) if e["name"] not in names]
+        path.write_text(json.dumps(entries, indent=2) + "\n")
+        commit_all(self.consumer, "Drop dependency from the manifest")
+
+    def test_unlisted_subtree_is_removed_and_committed(self):
+        """A subtree dropped from the manifest is deleted in its own commit."""
+        self._run_vendor()
+        self._drop_from_manifest("libgreet")
+        output = self._run_vendor()
+        self.assertIn("no longer listed", output)
+        self.assertFalse((self.consumer / "vendor/libgreet").exists())
+        self.assertTrue((self.consumer / "vendor/libanswer/libanswer.c").is_file())
+        self.assertEqual(
+            git(self.consumer, "log", "-1", "--format=%s"), "vendor: Removed libgreet"
+        )
+        self.assertEqual(git(self.consumer, "status", "--porcelain"), "")
+        head = git(self.consumer, "rev-parse", "HEAD")
+        # Nothing is left to do on the next run.
+        self.assertNotIn("no longer listed", self._run_vendor())
+        self.assertEqual(git(self.consumer, "rev-parse", "HEAD"), head)
+
+    def test_relisting_a_removed_subtree_imports_it_again(self):
+        """A removal ends the import history, so the same rev is not skipped."""
+        self._run_vendor()
+        self._drop_from_manifest("libgreet")
+        self._run_vendor()
+        self._write_manifest("v1.0.0")
+        commit_all(self.consumer, "List libgreet again")
+        self._run_vendor()
+        self._assert_release("v1.0.0")
+        self.assertEqual(git(self.consumer, "status", "--porcelain"), "")
+
+    def test_kept_and_unlisted_untracked_directories_are_left_alone(self):
+        """`keep` shields tracked directories; untracked ones are never deleted."""
+        self._run_vendor()
+        for name in ("handwritten", "scratch"):
+            (self.consumer / "vendor" / name).mkdir()
+            (self.consumer / "vendor" / name / "file.txt").write_text(name)
+        git(self.consumer, "add", "vendor/handwritten")
+        git(self.consumer, "commit", "-m", "Add hand written directory")
+        path = self.consumer / "vendor/vendor.json"
+        entries = json.loads(path.read_text())
+        entries.append({"name": "handwritten", "keep": True})
+        path.write_text(json.dumps(entries, indent=2) + "\n")
+        # Stage the manifest only, `scratch` must stay untracked.
+        git(self.consumer, "add", "vendor/vendor.json")
+        git(self.consumer, "commit", "-m", "Keep hand written directory")
+
+        result = self._run_vendor_result()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.consumer / "vendor/handwritten/file.txt").is_file())
+        self.assertTrue((self.consumer / "vendor/scratch/file.txt").is_file())
+        self.assertIn("vendor/scratch", result.stderr)
+        self.assertNotIn("handwritten", result.stderr)
+
+    def test_unlisted_tracked_directory_without_keep_is_removed(self):
+        """Hand written tracked directories need `keep` to survive."""
+        self._run_vendor()
+        (self.consumer / "vendor/handwritten").mkdir()
+        (self.consumer / "vendor/handwritten/file.txt").write_text("x")
+        commit_all(self.consumer, "Add hand written directory")
+        self._run_vendor()
+        self.assertFalse((self.consumer / "vendor/handwritten").exists())
 
 
 if __name__ == "__main__":
